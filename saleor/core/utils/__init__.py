@@ -1,12 +1,15 @@
 import decimal
 import logging
+import os
 from json import JSONEncoder
 from urllib.parse import urljoin
 
 from babel.numbers import get_territory_currencies
+from celery import shared_task
 from django import forms
 from django.conf import settings
 from django.contrib.sites.models import Site
+from django.core import serializers
 from django.core.paginator import InvalidPage, Paginator
 from django.http import Http404
 from django.utils.encoding import iri_to_uri, smart_text
@@ -14,12 +17,13 @@ from django_babel.templatetags.babel import currencyfmt
 from django_countries import countries
 from django_countries.fields import Country
 from django_prices_openexchangerates import exchange_currency
-
+from django_prices_openexchangerates.tasks import update_conversion_rates
 from geolite2 import geolite2
 from prices import MoneyRange
 from versatileimagefield.image_warmer import VersatileImageFieldWarmer
 
 from ...account.models import User
+from ...account.utils import get_random_avatar
 from ...core.i18n import COUNTRY_CODE_CHOICES
 
 georeader = geolite2.reader()
@@ -42,7 +46,7 @@ class CategoryChoiceField(forms.ModelChoiceField):
 
 
 def build_absolute_uri(location):
-    # type: (str, bool, saleor.site.models.SiteSettings) -> str
+    # type: (str) -> str
     host = Site.objects.get_current().domain
     protocol = 'https' if settings.ENABLE_SSL else 'http'
     current_uri = '%s://%s' % (protocol, host)
@@ -112,6 +116,12 @@ def to_local_currency(price, currency):
     return None
 
 
+@shared_task
+def update_conversion_rates_from_openexchangerates():
+    conversion_rates_queryset = update_conversion_rates()
+    return serializers.serialize('json', conversion_rates_queryset)
+
+
 def get_user_shipping_country(request):
     if request.user.is_authenticated:
         default_shipping = request.user.default_shipping_address
@@ -131,8 +141,13 @@ def create_superuser(credentials):
         email=credentials['email'], defaults={
             'is_active': True, 'is_staff': True, 'is_superuser': True})
     if created:
+        user.avatar = get_random_avatar()
         user.set_password(credentials['password'])
         user.save()
+        create_thumbnails(
+            pk=user.pk, model=User,
+            size_set='user_avatars', image_attr='avatar',
+        )
         msg = 'Superuser - %(email)s/%(password)s' % credentials
     else:
         msg = 'Superuser already exists - %(email)s' % credentials

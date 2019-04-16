@@ -10,14 +10,14 @@ from django.utils.translation import pgettext_lazy
 
 from ...account.models import CustomerNote, User
 from ...core.utils import get_paginator_items
-from ..emails import send_set_password_email
+from ..emails import send_set_password_customer_email
 from ..views import staff_member_required
 from .filters import UserFilter
 from .forms import CustomerDeleteForm, CustomerForm, CustomerNoteForm
 
 
 @staff_member_required
-@permission_required('account.view_user')
+@permission_required('account.manage_users')
 def customer_list(request):
     customers = (
         User.objects
@@ -38,7 +38,7 @@ def customer_list(request):
 
 
 @staff_member_required
-@permission_required('account.view_user')
+@permission_required('account.manage_users')
 def customer_details(request, pk):
     queryset = User.objects.prefetch_related(
         'orders', 'addresses', 'notes').select_related(
@@ -53,15 +53,16 @@ def customer_details(request, pk):
 
 
 @staff_member_required
-@permission_required('account.edit_user')
+@permission_required('account.manage_users')
 def customer_create(request):
     customer = User()
-    form = CustomerForm(request.POST or None, instance=customer)
+    form = CustomerForm(
+        request.POST or None, instance=customer, user=request.user)
     if form.is_valid():
         form.save()
         msg = pgettext_lazy(
             'Dashboard message', 'Added customer %s') % customer
-        send_set_password_email(customer)
+        send_set_password_customer_email.delay(customer.pk)
         messages.success(request, msg)
         return redirect('dashboard:customer-details', pk=customer.pk)
     ctx = {'form': form, 'customer': customer}
@@ -69,10 +70,11 @@ def customer_create(request):
 
 
 @staff_member_required
-@permission_required('account.edit_user')
+@permission_required('account.manage_users')
 def customer_edit(request, pk=None):
     customer = get_object_or_404(User, pk=pk)
-    form = CustomerForm(request.POST or None, instance=customer)
+    form = CustomerForm(
+        request.POST or None, instance=customer, user=request.user)
     if form.is_valid():
         form.save()
         msg = pgettext_lazy(
@@ -84,7 +86,7 @@ def customer_edit(request, pk=None):
 
 
 @staff_member_required
-@permission_required('account.view_user')
+@permission_required('account.manage_users')
 def ajax_users_list(request):
     queryset = User.objects.select_related('default_billing_address')
     search_query = request.GET.get('q', '')
@@ -93,14 +95,14 @@ def ajax_users_list(request):
             Q(default_billing_address__first_name__icontains=search_query) |
             Q(default_billing_address__last_name__icontains=search_query) |
             Q(email__icontains=search_query))
-
+    queryset = queryset.order_by('email')
     users = [
         {'id': user.pk, 'text': user.get_ajax_label()} for user in queryset]
     return JsonResponse({'results': users})
 
 
 @staff_member_required
-@permission_required('account.edit_user')
+@permission_required('account.manage_users')
 def customer_add_note(request, customer_pk):
     customer = get_object_or_404(User, pk=customer_pk)
     note = CustomerNote(customer=customer, user=request.user)
@@ -120,7 +122,7 @@ def customer_add_note(request, customer_pk):
 
 
 @staff_member_required
-@permission_required('account.edit_user')
+@permission_required('account.manage_users')
 def customer_delete(request, pk):
     customer = get_object_or_404(User, pk=pk)
     form = CustomerDeleteForm(

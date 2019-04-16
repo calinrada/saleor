@@ -17,7 +17,7 @@ def get_product_data(line, organization):
         '@type': 'Offer',
         'itemOffered': {
             '@type': 'Product',
-            'name': line.product_name,
+            'name': line.translated_product_name or line.product_name,
             'sku': line.product_sku,
         },
         'price': gross_product_price.amount,
@@ -32,8 +32,9 @@ def get_product_data(line, organization):
     product_url = build_absolute_uri(product.get_absolute_url())
     product_data['itemOffered']['url'] = product_url
 
-    image = product.get_first_image()
-    if image:
+    product_image = product.get_first_image()
+    if product_image:
+        image = product_image.image
         product_data['itemOffered']['image'] = build_absolute_uri(
             location=image.url)
     return product_data

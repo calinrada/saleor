@@ -1,21 +1,12 @@
-import pytest
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import AnonymousUser
 from django.urls import reverse
 
-from saleor.account.backends import BaseBackend
 from saleor.account.forms import LoginForm, SignupForm
 
 from .utils import get_redirect_location
 
 User = get_user_model()
-
-
-@pytest.fixture
-def base_backend():
-    base_backend = BaseBackend()
-    base_backend.DB_NAME = 'Backend'
-    return base_backend
 
 
 def test_login_form_valid(customer_user):
@@ -29,7 +20,7 @@ def test_login_form_not_valid(customer_user):
     data = {'user': 'test@example.com', 'password': 'wrongpassword'}
     form = LoginForm(data=data)
     assert not form.is_valid()
-    assert form.get_user_id() is None
+    assert form.get_user() is None
 
 
 def test_login_view_valid(client, customer_user):
@@ -49,21 +40,21 @@ def test_login_view_not_valid(client, customer_user):
 
 
 def test_login_view_next(client, customer_user):
-    url = reverse('account:login') + '?next=/cart/'
+    url = reverse('account:login') + '?next=/en/checkout/'
     post_data = {'username': 'test@example.com', 'password': 'password'}
     response = client.post(url, post_data, follow=True)
     redirect_location = response.request['PATH_INFO']
-    assert redirect_location == reverse('cart:index')
+    assert redirect_location == reverse('checkout:index')
 
 
 def test_login_view_redirect(client, customer_user):
     url = reverse('account:login')
     data = {
         'username': 'test@example.com', 'password': 'password',
-        'next': reverse('cart:index')}
+        'next': reverse('checkout:index')}
     response = client.post(url, data, follow=True)
     redirect_location = response.request['PATH_INFO']
-    assert redirect_location == reverse('cart:index')
+    assert redirect_location == reverse('checkout:index')
 
 
 def test_logout_view_no_user(client):
@@ -112,10 +103,10 @@ def test_signup_view_redirect(client, customer_user):
     url = reverse('account:signup')
     data = {
         'email': 'client@example.com', 'password': 'password',
-        'next': reverse('checkout:index')}
+        'next': reverse('checkout:start')}
     response = client.post(url, data)
     redirect_location = get_redirect_location(response)
-    assert redirect_location == reverse('checkout:index')
+    assert redirect_location == reverse('checkout:start')
 
 
 def test_signup_view_fail(client, db, customer_user):

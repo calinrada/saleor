@@ -12,7 +12,10 @@ import formatClear from '../../images/editor/format_clear.svg';
 import doneIcon from '../../images/done.svg';
 import closeIcon from '../../images/close.svg';
 
-// eslint-disable
+// Solve an auto-resize conflict between Materialize and medium-editor.
+$('.rich-text-editor').removeClass('materialize-textarea');
+
+// eslint-disable-next-line
 const editor = new MediumEditor('.rich-text-editor', {
   paste: {
     forcePlainText: true

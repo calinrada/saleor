@@ -1,28 +1,26 @@
 import json
-from io import BytesIO
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock
 
-from django.conf import settings
 from django.forms import HiddenInput
 from django.forms.models import model_to_dict
 from django.urls import reverse
-from PIL import Image
 from prices import Money, MoneyRange, TaxedMoney, TaxedMoneyRange
-from tests.utils import get_redirect_location
 
 from saleor.dashboard.product import ProductBulkAction
 from saleor.dashboard.product.forms import ProductForm, ProductVariantForm
 from saleor.product.forms import VariantChoiceField
 from saleor.product.models import (
-    AttributeChoiceValue, Collection, Product, ProductAttribute, ProductImage,
-    ProductType, ProductVariant)
+    Attribute, AttributeValue, Collection, Product, ProductImage, ProductType,
+    ProductVariant)
+from tests.utils import get_redirect_location
+
 from ..utils import create_image
 
 
 def test_view_product_list_with_filters(admin_client, product_list):
     url = reverse('dashboard:product-list')
     data = {
-        'price_1': [''], 'price_0': [''], 'is_featured': [''],
+        'price_max': [''], 'price_min': [''], 'is_featured': [''],
         'name': ['Test'], 'sort_by': [''], 'is_published': ['']}
 
     response = admin_client.get(url, data)
@@ -34,7 +32,7 @@ def test_view_product_list_with_filters(admin_client, product_list):
 def test_view_product_list_with_filters_sort_by(admin_client, product_list):
     url = reverse('dashboard:product-list')
     data = {
-        'price_1': [''], 'price_0': [''], 'is_featured': [''],
+        'price_max': [''], 'price_min': [''], 'is_featured': [''],
         'name': ['Test'], 'sort_by': ['name'], 'is_published': ['']}
 
     response = admin_client.get(url, data)
@@ -52,11 +50,11 @@ def test_view_product_list_with_filters_sort_by(admin_client, product_list):
 
 
 def test_view_product_list_with_filters_is_published(
-        admin_client, product_list, default_category):
+        admin_client, product_list, category):
     url = reverse('dashboard:product-list')
     data = {
-        'price_1': [''], 'price_0': [''], 'is_featured': [''],
-        'name': ['Test'], 'sort_by': ['name'], 'category': default_category.pk,
+        'price_max': [''], 'price_min': [''], 'is_featured': [''],
+        'name': ['Test'], 'sort_by': ['name'], 'category': category.pk,
         'is_published': ['1']}
 
     response = admin_client.get(url, data)
@@ -69,7 +67,7 @@ def test_view_product_list_with_filters_is_published(
 def test_view_product_list_with_filters_no_results(admin_client, product_list):
     url = reverse('dashboard:product-list')
     data = {
-        'price_1': [''], 'price_0': [''], 'is_featured': [''],
+        'price_max': [''], 'price_min': [''], 'is_featured': [''],
         'name': ['BADTest'], 'sort_by': [''], 'is_published': ['']}
 
     response = admin_client.get(url, data)
@@ -78,7 +76,7 @@ def test_view_product_list_with_filters_no_results(admin_client, product_list):
     assert list(response.context['filter_set'].qs) == []
 
 
-def test_view_product_list_pagination(admin_client, product_list):
+def test_view_product_list_pagination(admin_client, product_list, settings):
     settings.DASHBOARD_PAGINATE_BY = 1
     url = reverse('dashboard:product-list')
     data = {'page': '1'}
@@ -96,11 +94,12 @@ def test_view_product_list_pagination(admin_client, product_list):
     assert not response.context['filter_set'].is_bound_unsorted
 
 
-def test_view_product_list_pagination_with_filters(admin_client, product_list):
+def test_view_product_list_pagination_with_filters(
+        admin_client, product_list, settings):
     settings.DASHBOARD_PAGINATE_BY = 1
     url = reverse('dashboard:product-list')
     data = {
-        'page': '1', 'price_1': [''], 'price_0': [''], 'is_featured': [''],
+        'page': '1', 'price_max': [''], 'price_min': [''], 'is_featured': [''],
         'name': ['Test'], 'sort_by': ['name'], 'is_published': ['']}
 
     response = admin_client.get(url, data)
@@ -179,11 +178,11 @@ def test_view_product_select_type_by_ajax(admin_client, product_type):
         'dashboard:product-add', kwargs={'type_pk': product_type.pk})
 
 
-def test_view_product_create(admin_client, product_type, default_category):
+def test_view_product_create(admin_client, product_type, category):
     url = reverse('dashboard:product-add', kwargs={'type_pk': product_type.pk})
     data = {
         'name': 'Product', 'description': 'This is product description.',
-        'price': 10, 'category': default_category.pk, 'variant-sku': '123',
+        'price': 10, 'category': category.pk, 'variant-sku': '123',
         'variant-quantity': 2}
 
     response = admin_client.post(url, data)
@@ -232,7 +231,7 @@ def test_view_product_not_deleted_before_confirmation(
 
 def test_view_product_bulk_update_publish(admin_client, product_list):
     url = reverse('dashboard:product-bulk-update')
-    products =  [product.pk for product in product_list]
+    products = [product.pk for product in product_list]
     data = {'action': ProductBulkAction.PUBLISH, 'products': products}
 
     response = admin_client.post(url, data)
@@ -247,30 +246,10 @@ def test_view_product_bulk_update_publish(admin_client, product_list):
 
 def test_view_product_bulk_update_unpublish(admin_client, product_list):
     url = reverse('dashboard:product-bulk-update')
-    products =  [product.pk for product in product_list]
+    products = [product.pk for product in product_list]
     data = {'action': ProductBulkAction.UNPUBLISH, 'products': products}
 
     response = admin_client.post(url, data)
-
-    assert response.status_code == 302
-    assert get_redirect_location(response) == reverse('dashboard:product-list')
-
-    for p in product_list:
-        p.refresh_from_db()
-        assert not p.is_published
-
-
-def test_product_variant_form(product):
-    variant = product.variants.first()
-    variant.name = ''
-    variant.save()
-    example_size = 'Small Size'
-    data = {'attribute-size': example_size, 'sku': '1111', 'quantity': 2}
-    form = ProductVariantForm(data, instance=variant)
-    assert form.is_valid()
-    form.save()
-    variant.refresh_from_db()
-    assert variant.name == example_size
 
 
 def test_view_ajax_products_list(admin_client, product):
@@ -311,7 +290,8 @@ def test_view_product_type_create(
         'name': 'Testing Type',
         'product_attributes': [color_attribute.pk],
         'variant_attributes': [size_attribute.pk],
-        'has_variants': True}
+        'has_variants': True,
+        'weight': ['3.47']}
 
     response = admin_client.post(url, data)
 
@@ -329,7 +309,8 @@ def test_view_product_type_create_invalid(
         'name': 'Testing Type',
         'product_attributes': [size_attribute.pk],
         'variant_attributes': [color_attribute.pk, size_attribute.pk],
-        'has_variants': True}
+        'has_variants': True,
+        'weight': ['3.47']}
 
     response = admin_client.post(url, data)
 
@@ -344,7 +325,8 @@ def test_view_product_type_create_missing_variant_attributes(
         'name': 'Testing Type',
         'product_attributes': [color_attribute.pk],
         'variant_attributes': [size_attribute.pk],
-        'has_variants': False}
+        'has_variants': False,
+        'weight': ['3.47']}
     response = admin_client.post(url, data)
 
     assert response.status_code == 200
@@ -358,7 +340,8 @@ def test_view_product_type_create_variantless(
         'name': 'Testing Type',
         'product_attributes': [color_attribute.pk],
         'variant_attributes': [],
-        'has_variants': False}
+        'has_variants': False,
+        'weight': ['3.47']}
     response = admin_client.post(url, data)
 
     assert response.status_code == 302
@@ -375,7 +358,8 @@ def test_view_product_type_create_variantless_invalid(
         'name': 'Testing Type',
         'product_attributes': [color_attribute.pk],
         'variant_attributes': [size_attribute.pk],
-        'has_variants': False}
+        'has_variants': False,
+        'weight': ['3.47']}
     response = admin_client.post(url, data)
 
     assert response.status_code == 200
@@ -398,7 +382,8 @@ def test_view_product_type_edit_to_no_variants_valid(admin_client, product):
             'pk', flat=True),
         'variant_attributes': product_type.variant_attributes.values_list(
             'pk', flat=True),
-        'has_variants': False}
+        'has_variants': False,
+        'weight': ['3.47']}
 
     response = admin_client.post(url, data)
 
@@ -427,7 +412,8 @@ def test_view_product_type_edit_to_no_variants_invalid(admin_client, product):
             'pk', flat=True),
         'variant_attributes': product_type.variant_attributes.values_list(
             'pk', flat=True),
-        'has_variants': False}
+        'has_variants': False,
+        'weight': ['3.47']}
 
     response = admin_client.post(url, data)
 
@@ -481,7 +467,8 @@ def test_view_product_variant_details(admin_client, product):
 
 
 def test_view_product_variant_details_redirect_to_product(
-        admin_client, product):
+        admin_client, product_with_default_variant):
+    product = product_with_default_variant
     variant = product.variants.get()
     url = reverse(
         'dashboard:variant-details',
@@ -574,10 +561,11 @@ def test_view_variant_images(admin_client, product_with_image):
 
 
 def test_view_ajax_available_variants_list(
-        admin_client, product, default_category):
+        admin_client, product, category, settings):
     unavailable_product = Product.objects.create(
-        name='Test product', price=10, product_type=product.product_type,
-        category=default_category, is_published=False)
+        name='Test product', price=Money(10, settings.DEFAULT_CURRENCY),
+        product_type=product.product_type,
+        category=category, is_published=False)
     unavailable_product.variants.create()
     url = reverse('dashboard:ajax-available-variants')
 
@@ -740,7 +728,8 @@ def test_view_ajax_reorder_product_images(admin_client, product_with_images):
 def test_view_ajax_reorder_product_images_invalid(
         admin_client, product_with_images):
     order_before = [img.pk for img in product_with_images.images.all()]
-    ordered_images = list(reversed(order_before)).append(3)
+    ordered_images = list(reversed(order_before))
+    ordered_images.append(3)
     url = reverse(
         'dashboard:product-images-reorder',
         kwargs={'product_pk': product_with_images.pk})
@@ -778,8 +767,15 @@ def test_view_ajax_upload_image(monkeypatch, admin_client, product_with_image):
     mock_create_thumbnails.assert_called_once_with(images[1].pk)
 
 
+def test_view_attribute_list_no_results(admin_client):
+    url = reverse('dashboard:attributes')
+    response = admin_client.get(url)
+    assert response.status_code == 200
+    assert response.context['attributes'].object_list == []
+
+
 def test_view_attribute_list(db, admin_client, color_attribute):
-    url = reverse('dashboard:product-attributes')
+    url = reverse('dashboard:attributes')
 
     response = admin_client.get(url)
 
@@ -788,13 +784,13 @@ def test_view_attribute_list(db, admin_client, color_attribute):
     assert len(result) == 1
     assert result[0][0] == color_attribute.pk
     assert result[0][1] == color_attribute.name
-    assert len(result[0][2]) == 2
+    assert len(result[0][3]) == 2
     assert not response.context['is_empty']
 
 
 def test_view_attribute_details(admin_client, color_attribute):
     url = reverse(
-        'dashboard:product-attribute-details',
+        'dashboard:attribute-details',
         kwargs={'pk': color_attribute.pk})
 
     response = admin_client.get(url)
@@ -804,9 +800,9 @@ def test_view_attribute_details(admin_client, color_attribute):
 
 
 def test_view_attribute_details_no_choices(admin_client):
-    attribute = ProductAttribute.objects.create(slug='size', name='Size')
+    attribute = Attribute.objects.create(slug='size', name='Size')
     url = reverse(
-        'dashboard:product-attribute-details', kwargs={'pk': attribute.pk})
+        'dashboard:attribute-details', kwargs={'pk': attribute.pk})
 
     response = admin_client.get(url)
 
@@ -815,35 +811,35 @@ def test_view_attribute_details_no_choices(admin_client):
 
 
 def test_view_attribute_create(admin_client, color_attribute):
-    url = reverse('dashboard:product-attribute-add')
+    url = reverse('dashboard:attribute-add')
     data = {'name': 'test', 'slug': 'test'}
 
     response = admin_client.post(url, data, follow=True)
 
     assert response.status_code == 200
-    assert ProductAttribute.objects.count() == 2
+    assert Attribute.objects.count() == 2
 
 
 def test_view_attribute_create_not_valid(admin_client, color_attribute):
-    url = reverse('dashboard:product-attribute-add')
+    url = reverse('dashboard:attribute-add')
     data = {}
 
     response = admin_client.post(url, data, follow=True)
 
     assert response.status_code == 200
-    assert ProductAttribute.objects.count() == 1
+    assert Attribute.objects.count() == 1
 
 
 def test_view_attribute_edit(color_attribute, admin_client):
     url = reverse(
-        'dashboard:product-attribute-update',
+        'dashboard:attribute-update',
         kwargs={'pk': color_attribute.pk})
     data = {'name': 'new_name', 'slug': 'new_slug'}
 
     response = admin_client.post(url, data, follow=True)
 
     assert response.status_code == 200
-    assert ProductAttribute.objects.count() == 1
+    assert Attribute.objects.count() == 1
     color_attribute.refresh_from_db()
     assert color_attribute.name == 'new_name'
     assert color_attribute.slug == 'new_slug'
@@ -851,98 +847,98 @@ def test_view_attribute_edit(color_attribute, admin_client):
 
 def test_view_attribute_delete(admin_client, color_attribute):
     url = reverse(
-        'dashboard:product-attribute-delete',
+        'dashboard:attribute-delete',
         kwargs={'pk': color_attribute.pk})
 
     response = admin_client.post(url)
 
     assert response.status_code == 302
-    assert not ProductAttribute.objects.filter(pk=color_attribute.pk).exists()
+    assert not Attribute.objects.filter(pk=color_attribute.pk).exists()
 
 
 def test_view_attribute_not_deleted_before_confirmation(
         admin_client, color_attribute):
     url = reverse(
-        'dashboard:product-attribute-delete',
+        'dashboard:attribute-delete',
         kwargs={'pk': color_attribute.pk})
 
     response = admin_client.get(url)
 
     assert response.status_code == 200
-    assert ProductAttribute.objects.filter(pk=color_attribute.pk)
+    assert Attribute.objects.filter(pk=color_attribute.pk)
 
 
-def test_view_attribute_choice_value_create(color_attribute, admin_client):
-    values = AttributeChoiceValue.objects.filter(attribute=color_attribute.pk)
+def test_view_attribute_value_create(color_attribute, admin_client):
+    values = AttributeValue.objects.filter(attribute=color_attribute.pk)
     assert values.count() == 2
     url = reverse(
-        'dashboard:product-attribute-value-add',
+        'dashboard:attribute-value-add',
         kwargs={'attribute_pk': color_attribute.pk})
     data = {'name': 'Pink', 'attribute': color_attribute.pk}
 
     response = admin_client.post(url, data, follow=True)
 
     assert response.status_code == 200
-    values = AttributeChoiceValue.objects.filter(attribute=color_attribute.pk)
+    values = AttributeValue.objects.filter(attribute=color_attribute.pk)
     assert values.count() == 3
 
 
-def test_view_attribute_choice_value_create_invalid(
+def test_view_attribute_value_create_invalid(
         color_attribute, admin_client):
-    values = AttributeChoiceValue.objects.filter(attribute=color_attribute.pk)
+    values = AttributeValue.objects.filter(attribute=color_attribute.pk)
     assert values.count() == 2
     url = reverse(
-        'dashboard:product-attribute-value-add',
+        'dashboard:attribute-value-add',
         kwargs={'attribute_pk': color_attribute.pk})
     data = {}
 
     response = admin_client.post(url, data, follow=True)
 
     assert response.status_code == 200
-    values = AttributeChoiceValue.objects.filter(attribute=color_attribute.pk)
+    values = AttributeValue.objects.filter(attribute=color_attribute.pk)
     assert values.count() == 2
 
 
-def test_view_attribute_choice_value_edit(color_attribute, admin_client):
-    values = AttributeChoiceValue.objects.filter(attribute=color_attribute.pk)
+def test_view_attribute_value_edit(color_attribute, admin_client):
+    values = AttributeValue.objects.filter(attribute=color_attribute.pk)
     assert values.count() == 2
     url = reverse(
-        'dashboard:product-attribute-value-update',
+        'dashboard:attribute-value-update',
         kwargs={'attribute_pk': color_attribute.pk, 'value_pk': values[0].pk})
     data = {'name': 'Pink', 'attribute': color_attribute.pk}
 
     response = admin_client.post(url, data, follow=True)
 
     assert response.status_code == 200
-    values = AttributeChoiceValue.objects.filter(
+    values = AttributeValue.objects.filter(
         attribute=color_attribute.pk, name='Pink')
     assert len(values) == 1
     assert values[0].name == 'Pink'
 
 
-def test_view_attribute_choice_value_delete(color_attribute, admin_client):
-    values = AttributeChoiceValue.objects.filter(attribute=color_attribute.pk)
+def test_view_attribute_value_delete(color_attribute, admin_client):
+    values = AttributeValue.objects.filter(attribute=color_attribute.pk)
     assert values.count() == 2
     deleted_value = values[0]
     url = reverse(
-        'dashboard:product-attribute-value-delete',
+        'dashboard:attribute-value-delete',
         kwargs={
             'attribute_pk': color_attribute.pk, 'value_pk': deleted_value.pk})
 
     response = admin_client.post(url, follow=True)
 
     assert response.status_code == 200
-    values = AttributeChoiceValue.objects.filter(attribute=color_attribute.pk)
+    values = AttributeValue.objects.filter(attribute=color_attribute.pk)
     assert len(values) == 1
     assert deleted_value not in values
 
 
-def test_view_ajax_reorder_attribute_choice_values(
+def test_view_ajax_reorder_attribute_values(
         admin_client, color_attribute):
     order_before = [val.pk for val in color_attribute.values.all()]
     ordered_values = list(reversed(order_before))
     url = reverse(
-        'dashboard:product-attribute-values-reorder',
+        'dashboard:attribute-values-reorder',
         kwargs={'attribute_pk': color_attribute.pk})
     data = {'ordered_values': ordered_values}
     response = admin_client.post(
@@ -952,12 +948,13 @@ def test_view_ajax_reorder_attribute_choice_values(
     assert order_after == ordered_values
 
 
-def test_view_ajax_reorder_attribute_choice_values_invalid(
+def test_view_ajax_reorder_attribute_values_invalid(
         admin_client, color_attribute):
     order_before = [val.pk for val in color_attribute.values.all()]
-    ordered_values = list(reversed(order_before)).append(3)
+    ordered_values = list(reversed(order_before))
+    ordered_values.append(3)
     url = reverse(
-        'dashboard:product-attribute-values-reorder',
+        'dashboard:attribute-values-reorder',
         kwargs={'attribute_pk': color_attribute.pk})
     data = {'ordered_values': ordered_values}
     response = admin_client.post(
@@ -969,17 +966,22 @@ def test_view_ajax_reorder_attribute_choice_values_invalid(
 
 
 def test_get_formfield_name_with_unicode_characters(db):
-    text_attribute = ProductAttribute.objects.create(
+    text_attribute = Attribute.objects.create(
         slug='ąęαβδηθλμπ', name='ąęαβδηθλμπ')
-    assert text_attribute.get_formfield_name() == 'attribute-ąęαβδηθλμπ'
+    assert text_attribute.get_formfield_name() == 'attribute-ąęαβδηθλμπ-{}'.format(
+        text_attribute.pk)
 
 
-def test_product_variant_form(product):
+def test_product_variant_form(product, size_attribute):
     variant = product.variants.first()
     variant.name = ''
     variant.save()
+
     example_size = 'Small Size'
-    data = {'attribute-size': example_size, 'sku': '1111', 'quantity': 2}
+    data = {
+        'attribute-{}-{}'.format(
+            size_attribute.slug, size_attribute.pk): example_size,
+        'sku': '1111', 'quantity': 2}
 
     form = ProductVariantForm(data, instance=variant)
     assert form.is_valid()
@@ -990,9 +992,9 @@ def test_product_variant_form(product):
 
 
 def test_hide_field_in_variant_choice_field_form():
-    form = VariantChoiceField(Mock)
-    variants, cart = MagicMock(), MagicMock()
-    variants.count.return_value = 1
+    form = VariantChoiceField(Mock())
+    variants, checkout = MagicMock(), MagicMock()
+    variants.count.return_value = variants.all().count.return_value = 1
     variants.all()[0].pk = 'test'
 
     form.update_field_data(variants, discounts=None, taxes=None)
@@ -1003,7 +1005,7 @@ def test_hide_field_in_variant_choice_field_form():
 
 def test_product_form_change_attributes(db, product, color_attribute):
     product_type = product.product_type
-    text_attribute = ProductAttribute.objects.create(
+    text_attribute = Attribute.objects.create(
         slug='author', name='Author')
     product_type.product_attributes.add(text_attribute)
     color_value = color_attribute.values.first()
@@ -1013,8 +1015,10 @@ def test_product_form_change_attributes(db, product, color_attribute):
         'price': product.price.amount,
         'category': product.category.pk,
         'description': 'description',
-        'attribute-author': new_author,
-        'attribute-color': color_value.pk}
+        'attribute-{}-{}'.format(
+            text_attribute.slug, text_attribute.pk): new_author,
+        'attribute-{}-{}'.format(
+            color_attribute.slug, color_attribute.pk): color_value.pk}
 
     form = ProductForm(data, instance=product)
     assert form.is_valid()
@@ -1023,7 +1027,7 @@ def test_product_form_change_attributes(db, product, color_attribute):
     assert product.attributes[str(color_attribute.pk)] == str(color_value.pk)
 
     # Check that new attribute was created for author
-    author_value = AttributeChoiceValue.objects.get(name=new_author)
+    author_value = AttributeValue.objects.get(name=new_author)
     assert product.attributes[str(text_attribute.pk)] == str(author_value.pk)
 
 
@@ -1045,10 +1049,10 @@ def test_product_form_assign_collection_to_product(product):
 
 
 def test_product_form_sanitize_product_description(
-        product_type, default_category):
+        product_type, category, settings):
     product = Product.objects.create(
-        name='Test Product', price=10, description='', pk=10,
-        product_type=product_type, category=default_category)
+        name='Test Product', price=Money(10, settings.DEFAULT_CURRENCY),
+        description='', pk=10, product_type=product_type, category=category)
     data = model_to_dict(product)
     data['description'] = (
         '<b>bold</b><p><i>italic</i></p><h2>Header</h2><h3>subheader</h3>'
@@ -1108,10 +1112,13 @@ def test_product_form_seo_description_too_long(unavailable_product):
     assert form.is_valid()
 
     form.save()
-    assert len(unavailable_product.seo_description) <= 300
-    assert unavailable_product.seo_description == (
+    new_seo_description = unavailable_product.seo_description
+    assert len(new_seo_description) <= 300
+    assert new_seo_description.startswith(
         'Saying it fourth made saw light bring beginning kind over herb '
         'won\'t creepeth multiply dry rule divided fish herb cattle greater '
         'fly divided midst, gathering can\'t moveth seed greater subdue. '
         'Lesser meat living fowl called. Dry don\'t wherein. Doesn\'t above '
-        'form sixth. Image moving earth without f...')
+        'form sixth. Image moving earth without')
+    assert (
+        new_seo_description.endswith('...') or new_seo_description[-1] == '…')

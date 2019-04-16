@@ -1,5 +1,6 @@
 import csv
 import gzip
+from datetime import date
 
 from django.conf import settings
 from django.contrib.sites.models import Site
@@ -9,7 +10,7 @@ from django.utils.encoding import smart_text
 
 from ..discount.models import Sale
 from ..product.models import (
-    AttributeChoiceValue, Category, ProductAttribute, ProductVariant)
+    Attribute, AttributeValue, Category, ProductVariant)
 
 CATEGORY_SEPARATOR = ' > '
 
@@ -115,8 +116,9 @@ def item_group_id(item):
 
 
 def item_image_link(item, current_site):
-    image = item.get_first_image()
-    if image:
+    product_image = item.get_first_image()
+    if product_image:
+        image = product_image.image
         return add_domain(current_site.domain, image.url, False)
     return None
 
@@ -195,11 +197,11 @@ def write_feed(file_obj):
     writer = csv.DictWriter(file_obj, ATTRIBUTES, dialect=csv.excel_tab)
     writer.writeheader()
     categories = Category.objects.all()
-    discounts = Sale.objects.all().prefetch_related('products',
-                                                    'categories')
-    attributes_dict = {a.slug: a.pk for a in ProductAttribute.objects.all()}
+    discounts = Sale.objects.active(date.today()).prefetch_related(
+        'products', 'categories')
+    attributes_dict = {a.slug: a.pk for a in Attribute.objects.all()}
     attribute_values_dict = {smart_text(a.pk): smart_text(a) for a
-                             in AttributeChoiceValue.objects.all()}
+                             in AttributeValue.objects.all()}
     category_paths = {}
     current_site = Site.objects.get_current()
     for item in get_feed_items():

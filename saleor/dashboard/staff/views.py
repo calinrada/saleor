@@ -8,7 +8,7 @@ from django.utils.translation import pgettext_lazy
 from ...account.models import User
 from ...core.utils import get_paginator_items
 from ..emails import (
-    send_promote_customer_to_staff_email, send_set_password_email)
+    send_promote_customer_to_staff_email, send_set_password_staff_email)
 from ..views import staff_member_required
 from .filters import StaffFilter
 from .forms import StaffForm
@@ -16,7 +16,7 @@ from .utils import remove_staff_member
 
 
 @staff_member_required
-@permission_required('account.view_staff')
+@permission_required('account.manage_staff')
 def staff_list(request):
     staff_members = User.objects.filter(is_staff=True).prefetch_related(
         'default_billing_address').order_by('email')
@@ -31,7 +31,7 @@ def staff_list(request):
 
 
 @staff_member_required
-@permission_required('account.edit_staff')
+@permission_required('account.manage_staff')
 def staff_details(request, pk):
     queryset = User.objects.filter(is_staff=True)
     staff_member = get_object_or_404(queryset, pk=pk)
@@ -42,13 +42,13 @@ def staff_details(request, pk):
         msg = pgettext_lazy(
             'Dashboard message', 'Updated staff member %s') % (staff_member,)
         messages.success(request, msg)
-        redirect('dashboard:staff-list')
+        return redirect('dashboard:staff-list')
     ctx = {'staff_member': staff_member, 'form': form}
     return TemplateResponse(request, 'dashboard/staff/detail.html', ctx)
 
 
 @staff_member_required
-@permission_required('account.edit_staff')
+@permission_required('account.manage_staff')
 def staff_create(request):
     try:
         staff = User.objects.get(email=request.POST.get('email'))
@@ -56,23 +56,25 @@ def staff_create(request):
     except User.DoesNotExist:
         staff = User()
         created = True
-    form = StaffForm(request.POST or None, instance=staff)
+    form = StaffForm(
+        request.POST or None,
+        instance=staff, user=request.user, initial={'is_staff': True})
     if form.is_valid():
         form.save()
         msg = pgettext_lazy(
             'Dashboard message', 'Added staff member %s') % (staff,)
         messages.success(request, msg)
         if created:
-            send_set_password_email(staff)
+            send_set_password_staff_email.delay(staff.pk)
         else:
-            send_promote_customer_to_staff_email(staff)
+            send_promote_customer_to_staff_email.delay(staff.pk)
         return redirect('dashboard:staff-list')
     ctx = {'form': form}
     return TemplateResponse(request, 'dashboard/staff/detail.html', ctx)
 
 
 @staff_member_required
-@permission_required('account.edit_staff')
+@permission_required('account.manage_staff')
 def staff_delete(request, pk):
     queryset = User.objects.prefetch_related('orders')
     staff = get_object_or_404(queryset, pk=pk)

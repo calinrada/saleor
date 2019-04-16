@@ -3,17 +3,17 @@ from collections import defaultdict
 import i18naddress
 from django import forms
 from django.forms.forms import BoundField
-from django.utils.translation import pgettext_lazy
-from django_countries.data import COUNTRIES
-from phonenumber_field.formfields import PhoneNumberField
+from django.utils.translation import pgettext_lazy, ugettext_lazy as _
+from django_countries import countries
+from phonenumber_field.phonenumber import PhoneNumber
+from phonenumbers import NumberParseException
+from phonenumbers.phonenumberutil import is_possible_number
 
 from .models import Address
-from .validators import validate_possible_number
 from .widgets import DatalistTextWidget, PhonePrefixWidget
 
 COUNTRY_FORMS = {}
 UNKNOWN_COUNTRIES = set()
-
 
 AREA_TYPE_TRANSLATIONS = {
     'area': pgettext_lazy('Address field', 'Area'),
@@ -38,13 +38,12 @@ AREA_TYPE_TRANSLATIONS = {
     'zip': pgettext_lazy('Address field', 'ZIP code')}
 
 
-class PossiblePhoneNumberFormField(PhoneNumberField):
-    """A PhoneNumberField that allows phone numbers from other countries."""
+class PossiblePhoneNumberFormField(forms.CharField):
+    """A phone input field."""
 
-    default_validators = [validate_possible_number]
-
-    def to_python(self, value):
-        return value
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.widget.input_type = 'tel'
 
 
 class CountryAreaChoiceField(forms.ChoiceField):
@@ -61,9 +60,7 @@ class AddressMetaForm(forms.ModelForm):
     class Meta:
         model = Address
         fields = ['country', 'preview']
-        labels = {
-            'country': pgettext_lazy(
-                'Country', 'Country')}
+        labels = {'country': pgettext_lazy('Country', 'Country')}
 
     def clean(self):
         data = super().clean()
@@ -101,8 +98,7 @@ class AddressForm(forms.ModelForm):
                 'Company or organization', 'Company or organization'),
             'street_address_1': pgettext_lazy(
                 'Address', 'Address'),
-            'street_address_2': pgettext_lazy(
-                'Address', 'Address'),
+            'street_address_2': '',
             'city': pgettext_lazy(
                 'City', 'City'),
             'city_area': pgettext_lazy(
@@ -115,6 +111,11 @@ class AddressForm(forms.ModelForm):
                 'Country area', 'State or province'),
             'phone': pgettext_lazy(
                 'Phone number', 'Phone number')}
+        placeholders = {
+            'street_address_1': pgettext_lazy(
+                'Address', 'Street address, P.O. box, company name'),
+            'street_address_2': pgettext_lazy(
+                'Address', 'Apartment, suite, unit, building, floor, etc')}
 
     phone = PossiblePhoneNumberFormField(
         widget=PhonePrefixWidget, required=False)
@@ -122,6 +123,10 @@ class AddressForm(forms.ModelForm):
     def __init__(self, *args, **kwargs):
         autocomplete_type = kwargs.pop('autocomplete_type', None)
         super().__init__(*args, **kwargs)
+        # countries order was taken as defined in the model,
+        # not being sorted accordingly to the selected language
+        self.fields['country'].choices = sorted(
+            COUNTRY_CHOICES, key=lambda choice: choice[1])
         autocomplete_dict = defaultdict(
             lambda: 'off', self.AUTOCOMPLETE_MAPPING)
         for field_name, field in self.fields.items():
@@ -131,6 +136,33 @@ class AddressForm(forms.ModelForm):
             else:
                 autocomplete = autocomplete_dict[field_name]
             field.widget.attrs['autocomplete'] = autocomplete
+            field.widget.attrs['placeholder'] = field.label if not hasattr(
+                field, 'placeholder') else field.placeholder
+
+    def clean(self):
+        data = super().clean()
+        phone = data.get('phone')
+        country = data.get('country')
+        if phone:
+            try:
+                data['phone'] = clean_phone_for_country(phone, country)
+            except forms.ValidationError as error:
+                self.add_error('phone', error)
+        return data
+
+
+def clean_phone_for_country(phone, country):
+    error = _('The phone number entered is not valid.')
+    error_code = 'invalid_phone_number'
+    if phone:
+        try:
+            phone = PhoneNumber.from_string(phone, country)
+        except NumberParseException:
+            raise forms.ValidationError(error, code=error_code)
+        else:
+            if not is_possible_number(phone):
+                raise forms.ValidationError(error, code=error_code)
+    return phone
 
 
 class CountryAwareAddressForm(AddressForm):
@@ -213,6 +245,10 @@ def update_base_fields(form_class, i18n_rules):
         field = form_class.base_fields[field_name]
         field.label = label_value
 
+    for field_name, placeholder_value in AddressForm.Meta.placeholders.items():
+        field = form_class.base_fields[field_name]
+        field.placeholder = placeholder_value
+
     if i18n_rules.country_area_choices:
         form_class.base_fields['country_area'] = CountryAreaChoiceField(
             choices=i18n_rules.country_area_choices)
@@ -241,14 +277,14 @@ def construct_address_form(country_code, i18n_rules):
     form_kwargs = {
         'Meta': type(str('Meta'), (base_class.Meta, object), {}),
         'formfield_callback': None}
-    class_ = type(base_class)(str(class_name), (base_class,), form_kwargs)
+    class_ = type(base_class)(str(class_name), (base_class, ), form_kwargs)
     update_base_fields(class_, i18n_rules)
     class_.i18n_country_code = country_code
     class_.i18n_fields_order = property(get_form_i18n_lines)
     return class_
 
 
-for country in COUNTRIES.keys():
+for country in countries.countries.keys():
     try:
         country_rules = i18naddress.get_validation_rules(
             {'country_code': country})
@@ -256,7 +292,7 @@ for country in COUNTRIES.keys():
         country_rules = i18naddress.get_validation_rules({})
         UNKNOWN_COUNTRIES.add(country)
 
-COUNTRY_CHOICES = [(code, label) for code, label in COUNTRIES.items()
+COUNTRY_CHOICES = [(code, label) for code, label in countries.countries.items()
                    if code not in UNKNOWN_COUNTRIES]
 # Sort choices list by country name
 COUNTRY_CHOICES = sorted(COUNTRY_CHOICES, key=lambda choice: choice[1])

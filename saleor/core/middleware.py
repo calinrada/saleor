@@ -1,4 +1,5 @@
 import logging
+from datetime import date
 
 from django.conf import settings
 from django.contrib.sites.models import Site
@@ -6,8 +7,8 @@ from django.utils.functional import SimpleLazyObject
 from django.utils.translation import get_language
 from django_countries.fields import Country
 
-from . import analytics
 from ..discount.models import Sale
+from . import analytics
 from .utils import get_client_ip, get_country_by_ip, get_currency_for_country
 from .utils.taxes import get_taxes_for_country
 
@@ -33,7 +34,8 @@ def google_analytics(get_response):
 def discounts(get_response):
     """Assign active discounts to `request.discounts`."""
     def middleware(request):
-        discounts = Sale.objects.prefetch_related('products', 'categories')
+        discounts = Sale.objects.active(date.today()).prefetch_related(
+            'products', 'categories', 'collections')
         request.discounts = discounts
         return get_response(request)
 

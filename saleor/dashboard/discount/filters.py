@@ -12,21 +12,36 @@ from ..widgets import DateRangeWidget
 
 SORT_BY_FIELDS_SALE = {
     'name': pgettext_lazy('Sale list sorting option', 'name'),
-    'value': pgettext_lazy('Sale list sorting option', 'value')}
+    'value': pgettext_lazy('Sale list sorting option', 'value'),
+    'start_date': pgettext_lazy('Sale list sorting option', 'start_date'),
+    'end_date': pgettext_lazy('Sale list sorting option', 'end_date')}
 
 SORT_BY_FIELDS_LABELS_VOUCHER = {
     'name': pgettext_lazy('Voucher list sorting option', 'name'),
     'discount_value': pgettext_lazy(
         'Voucher list sorting option', 'discount_value'),
-    'apply_to': pgettext_lazy('Voucher list sorting option', 'apply_to'),
+    'countries': pgettext_lazy('Voucher list sorting option', 'countries'),
     'start_date': pgettext_lazy('Voucher list sorting option', 'start_date'),
     'end_date': pgettext_lazy('Voucher list sorting option', 'end_date'),
     'used': pgettext_lazy('Voucher list sorting option', 'used'),
-    'limit': pgettext_lazy('Voucher list sorting option', 'limit')}
+    'min_amount_spent': pgettext_lazy(
+        'Voucher list sorting option', 'min_amount_spent')}
 
 DISCOUNT_TYPE_CHOICES = (
     ('fixed', pgettext_lazy('Sale type filter choice', 'USD')),
     ('percentage', pgettext_lazy('Sale type filter choice', '%')))
+
+
+def filter_by_date_range(queryset, name, value):
+    q = Q()
+    if value.start:
+        q = Q(start_date__gte=value.start)
+    if value.stop:
+        if value.start:
+            q |= Q(end_date__lte=value.stop)
+        else:
+            q = Q(end_date__lte=value.stop)
+    return queryset.filter(q)
 
 
 class SaleFilter(SortedFilterSet):
@@ -35,7 +50,7 @@ class SaleFilter(SortedFilterSet):
         lookup_expr='icontains')
     categories = ModelMultipleChoiceFilter(
         label=pgettext_lazy('Sale list filter label', 'Categories'),
-        name='categories',
+        field_name='categories',
         queryset=Category.objects.all())
     type = ChoiceFilter(
         label=pgettext_lazy('Sale list filter label', 'Discount type'),
@@ -44,6 +59,11 @@ class SaleFilter(SortedFilterSet):
         widget=forms.Select)
     value = RangeFilter(
         label=pgettext_lazy('Sale list filter label', 'Value'))
+    date = DateFromToRangeFilter(
+        label=pgettext_lazy(
+            'Sale list sorting filter label', 'Period of validity'),
+        field_name='created', widget=DateRangeWidget,
+        method=filter_by_date_range)
     sort_by = OrderingFilter(
         label=pgettext_lazy('Sale list filter label', 'Sort by'),
         fields=SORT_BY_FIELDS_SALE.keys(),
@@ -67,7 +87,7 @@ class VoucherFilter(SortedFilterSet):
         label=pgettext_lazy('Voucher list name filter label', 'Name'),
         lookup_expr='icontains')
     type = ChoiceFilter(
-        name='discount_value_type',
+        field_name='discount_value_type',
         label=pgettext_lazy(
             'Sale list is sale type filter label', 'Discount type'),
         choices=DISCOUNT_TYPE_CHOICES,
@@ -77,11 +97,13 @@ class VoucherFilter(SortedFilterSet):
         label=pgettext_lazy('Sale list filter label', 'Discount_value'))
     date = DateFromToRangeFilter(
         label=pgettext_lazy(
-            'Order list sorting filter label', 'Period of validity'),
-        name='created', widget=DateRangeWidget, method='filter_by_date_range')
-    limit = RangeFilter(
-        label=pgettext_lazy('Voucher list sorting filter', 'Limit'),
-        name='limit')
+            'Voucher list sorting filter label', 'Period of validity'),
+        field_name='created', widget=DateRangeWidget,
+        method=filter_by_date_range)
+    min_amount_spent = RangeFilter(
+        label=pgettext_lazy(
+            'Voucher list sorting filter', 'Minimum amount spent'),
+        field_name='min_amount_spent')
     sort_by = OrderingFilter(
         label=pgettext_lazy('Voucher list sorting filter label', 'Sort by'),
         fields=SORT_BY_FIELDS_LABELS_VOUCHER.keys(),
@@ -90,17 +112,6 @@ class VoucherFilter(SortedFilterSet):
     class Meta:
         model = Voucher
         fields = []
-
-    def filter_by_date_range(self, queryset, name, value):
-        q = Q()
-        if value.start:
-            q = Q(start_date__gte=value.start)
-        if value.stop:
-            if value.start:
-                q |= Q(end_date__lte=value.stop)
-            else:
-                q = Q(end_date__lte=value.stop)
-        return queryset.filter(q)
 
     def get_summary_message(self):
         counter = self.qs.count()

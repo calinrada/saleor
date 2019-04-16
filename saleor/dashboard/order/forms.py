@@ -3,32 +3,32 @@ from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.urls import reverse, reverse_lazy
 from django.utils.translation import npgettext_lazy, pgettext_lazy
-from django_prices.forms import MoneyField
-from payments import PaymentError, PaymentStatus
 
 from ...account.i18n import (
-    AddressForm as StorefrontAddressForm, PossiblePhoneNumberFormField)
+    AddressForm as StorefrontAddressForm, PossiblePhoneNumberFormField,
+    clean_phone_for_country)
 from ...account.models import User
 from ...checkout.forms import QuantityField
 from ...core.exceptions import InsufficientStock
 from ...core.utils.taxes import ZERO_TAXED_MONEY
 from ...discount.models import Voucher
 from ...discount.utils import decrease_voucher_usage, increase_voucher_usage
-from ...order import CustomPaymentChoices, OrderStatus
-from ...order.emails import send_note_confirmation
-from ...order.models import (
-    Fulfillment, FulfillmentLine, Order, OrderLine, OrderNote, Payment)
+from ...order import OrderStatus
+from ...order.models import Fulfillment, FulfillmentLine, Order, OrderLine
 from ...order.utils import (
     add_variant_to_order, cancel_fulfillment, cancel_order,
-    change_order_line_quantity, recalculate_order)
+    change_order_line_quantity, delete_order_line, fulfill_order_line,
+    recalculate_order)
+from ...payment import ChargeStatus, CustomPaymentChoices, PaymentError
+from ...payment.utils import (
+    clean_mark_order_as_paid, gateway_capture, gateway_refund, gateway_void,
+    mark_order_as_paid)
 from ...product.models import Product, ProductVariant
 from ...product.utils import allocate_stock, deallocate_stock
-from ...shipping.models import ANY_COUNTRY, ShippingMethodCountry
+from ...shipping.models import ShippingMethod
 from ..forms import AjaxSelect2ChoiceField
 from ..widgets import PhonePrefixWidget
-from .utils import (
-    fulfill_order_line, remove_customer_from_order,
-    update_order_with_user_addresses)
+from .utils import remove_customer_from_order, update_order_with_user_addresses
 
 
 class CreateOrderFromDraftForm(forms.ModelForm):
@@ -60,8 +60,7 @@ class CreateOrderFromDraftForm(forms.ModelForm):
             shipping_address = self.instance.shipping_address
             shipping_not_valid = (
                 method and shipping_address and
-                method.country_code != ANY_COUNTRY and
-                shipping_address.country.code != method.country_code)
+                shipping_address.country.code not in method.shipping_zone.countries)  # noqa
             if shipping_not_valid:
                 errors.append(forms.ValidationError(pgettext_lazy(
                     'Create draft order form error',
@@ -98,13 +97,15 @@ class OrderCustomerForm(forms.ModelForm):
     user = AjaxSelect2ChoiceField(
         queryset=User.objects.all(),
         fetch_data_url=reverse_lazy('dashboard:ajax-users-list'),
-        required=False)
+        required=False,
+        label=pgettext_lazy(
+            'Order form: editing customer details - selecting a customer',
+            'Customer'))
 
     class Meta:
         model = Order
         fields = ['user', 'user_email']
         labels = {
-            'user': pgettext_lazy('Order customer', 'User'),
             'user_email': pgettext_lazy(
                 'Order customer email',
                 'Email')}
@@ -147,16 +148,14 @@ class OrderRemoveCustomerForm(forms.ModelForm):
 
 class OrderShippingForm(forms.ModelForm):
     """Set shipping name and shipping price in an order."""
-
     shipping_method = AjaxSelect2ChoiceField(
-        queryset=ShippingMethodCountry.objects.all(), min_input=0)
+        queryset=ShippingMethod.objects.all(), min_input=0,
+        label=pgettext_lazy(
+            'Shipping method form field label', 'Shipping method'))
 
     class Meta:
         model = Order
         fields = ['shipping_method']
-        labels = {
-            'shipping_method': pgettext_lazy(
-                'Shipping method form field label', 'Shipping method')}
 
     def __init__(self, *args, **kwargs):
         self.taxes = kwargs.pop('taxes')
@@ -173,14 +172,14 @@ class OrderShippingForm(forms.ModelForm):
 
         if self.instance.shipping_address:
             country_code = self.instance.shipping_address.country.code
-            queryset = method_field.queryset.unique_for_country_code(
-                country_code)
+            queryset = method_field.queryset.filter(
+                shipping_zone__countries__contains=country_code)
             method_field.queryset = queryset
 
     def save(self, commit=True):
         method = self.instance.shipping_method
-        self.instance.shipping_method_name = method.shipping_method.name
-        self.instance.shipping_price = method.get_total_price(self.taxes)
+        self.instance.shipping_method_name = method.name
+        self.instance.shipping_price = method.get_total(self.taxes)
         recalculate_order(self.instance)
         return super().save(commit)
 
@@ -220,13 +219,12 @@ class OrderEditVoucherForm(forms.ModelForm):
     """Edit discount amount in an order."""
     voucher = AjaxSelect2ChoiceField(
         queryset=Voucher.objects.all(),
-        fetch_data_url=reverse_lazy('dashboard:ajax-vouchers'), min_input=0)
+        fetch_data_url=reverse_lazy('dashboard:ajax-vouchers'), min_input=0,
+        label=pgettext_lazy('Order voucher', 'Voucher'))
 
     class Meta:
         model = Order
         fields = ['voucher']
-        labels = {
-            'voucher': pgettext_lazy('Order voucher', 'Voucher')}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -241,42 +239,33 @@ class OrderEditVoucherForm(forms.ModelForm):
                 decrease_voucher_usage(self.old_voucher)
             increase_voucher_usage(voucher)
         self.instance.discount_name = voucher.name or ''
+        self.instance.translated_discount_name = (
+            voucher.translated.name
+            if voucher.translated.name != voucher.name else '')
         recalculate_order(self.instance)
         return super().save(commit)
 
 
-class OrderNoteForm(forms.ModelForm):
-    class Meta:
-        model = OrderNote
-        fields = ['content', 'is_public']
-        widgets = {
-            'content': forms.Textarea()}
-        labels = {
-            'content': pgettext_lazy('Order note', 'Note'),
-            'is_public': pgettext_lazy(
-                'Allow customers to see note toggle',
-                'Customer can see this note')}
-
-    def send_confirmation_email(self):
-        if self.instance.order.get_user_current_email():
-            send_note_confirmation.delay(self.instance.order.pk)
+class OrderNoteForm(forms.Form):
+    message = forms.CharField(
+        label=pgettext_lazy('Order note', 'Note'), widget=forms.Textarea())
 
 
-class ManagePaymentForm(forms.Form):
-    amount = MoneyField(
+class BasePaymentForm(forms.Form):
+
+    amount = forms.DecimalField(
         label=pgettext_lazy(
-            'Payment management form (capture, refund, release)', 'Amount'),
-        max_digits=12,
-        decimal_places=settings.DEFAULT_DECIMAL_PLACES,
-        currency=settings.DEFAULT_CURRENCY)
+            'Payment management form (capture, refund, void)', 'Amount'),
+        max_digits=settings.DEFAULT_MAX_DIGITS,
+        decimal_places=settings.DEFAULT_DECIMAL_PLACES)
+
+    clean_error = pgettext_lazy(
+        'Payment form error',
+        'This payment action can not be performed.')
 
     def __init__(self, *args, **kwargs):
         self.payment = kwargs.pop('payment')
         super().__init__(*args, **kwargs)
-
-    def clean(self):
-        if self.payment.status != self.clean_status:
-            raise forms.ValidationError(self.clean_error)
 
     def payment_error(self, message):
         self.add_error(
@@ -284,64 +273,69 @@ class ManagePaymentForm(forms.Form):
                 'Payment form error', 'Payment gateway error: %s') % message)
 
     def try_payment_action(self, action):
-        money = self.cleaned_data['amount']
+        amount = self.cleaned_data['amount']
         try:
-            action(money.amount)
+            action(self.payment, amount)
         except (PaymentError, ValueError) as e:
             self.payment_error(str(e))
             return False
         return True
 
 
-class CapturePaymentForm(ManagePaymentForm):
+class CapturePaymentForm(BasePaymentForm):
 
-    clean_status = PaymentStatus.PREAUTH
-    clean_error = pgettext_lazy('Payment form error',
-                                'Only pre-authorized payments can be captured')
-
-    def capture(self):
-        return self.try_payment_action(self.payment.capture)
-
-
-class RefundPaymentForm(ManagePaymentForm):
-
-    clean_status = PaymentStatus.CONFIRMED
-    clean_error = pgettext_lazy('Payment form error',
-                                'Only confirmed payments can be refunded')
+    clean_error = pgettext_lazy(
+        'Payment form error',
+        'Only pre-authorized payments can be captured')
 
     def clean(self):
-        super().clean()
-        if self.payment.variant == CustomPaymentChoices.MANUAL:
+        if not self.payment.can_capture():
+            raise forms.ValidationError(self.clean_error)
+
+    def capture(self):
+        return self.try_payment_action(gateway_capture)
+
+
+class RefundPaymentForm(BasePaymentForm):
+
+    clean_error = pgettext_lazy(
+        'Payment form error',
+        'Only confirmed payments can be refunded')
+
+    def clean(self):
+        if not self.payment.can_refund():
+            raise forms.ValidationError(self.clean_error)
+
+        if self.payment.gateway == CustomPaymentChoices.MANUAL:
             raise forms.ValidationError(
                 pgettext_lazy(
                     'Payment form error',
                     'Manual payments can not be refunded'))
 
     def refund(self):
-        return self.try_payment_action(self.payment.refund)
+        return self.try_payment_action(gateway_refund)
 
 
-class ReleasePaymentForm(forms.Form):
+class VoidPaymentForm(BasePaymentForm):
+
+    clean_error = pgettext_lazy(
+        'Payment form error',
+        'Only pre-authorized payments can be voided')
 
     def __init__(self, *args, **kwargs):
-        self.payment = kwargs.pop('payment')
         super().__init__(*args, **kwargs)
+        self.payment = kwargs.pop('payment')
+        # The amount field is popped out
+        # since there is no amount argument for void operation
+        self.fields.pop('amount')
 
     def clean(self):
-        if self.payment.status != PaymentStatus.PREAUTH:
-            raise forms.ValidationError(
-                pgettext_lazy(
-                    'Payment form error',
-                    'Only pre-authorized payments can be released'))
+        if not self.payment.can_void():
+            raise forms.ValidationError(self.clean_error)
 
-    def payment_error(self, message):
-        self.add_error(
-            None, pgettext_lazy(
-                'Payment form error', 'Payment gateway error: %s') % message)
-
-    def release(self):
+    def void(self):
         try:
-            self.payment.release()
+            gateway_void(self.payment)
         except (PaymentError, ValueError) as e:
             self.payment_error(str(e))
             return False
@@ -353,30 +347,18 @@ class OrderMarkAsPaidForm(forms.Form):
 
     def __init__(self, *args, **kwargs):
         self.order = kwargs.pop('order')
+        self.user = kwargs.pop('user')
         super().__init__(*args, **kwargs)
 
     def clean(self):
         super().clean()
-        if self.order.payments.exists():
-            raise forms.ValidationError(
-                pgettext_lazy(
-                    'Mark order as paid form error',
-                    'Orders with payments can not be manually marked as paid'))
+        try:
+            clean_mark_order_as_paid(self.order)
+        except PaymentError as e:
+            raise forms.ValidationError(str(e))
 
     def save(self):
-        defaults = {
-            'total': self.order.total.gross.amount,
-            'tax': self.order.total.tax.amount,
-            'currency': self.order.total.currency,
-            'delivery': self.order.shipping_price.net.amount,
-            'description': pgettext_lazy(
-                'Payment description', 'Order %(order)s') % {
-                    'order': self.order},
-            'captured_amount': self.order.total.gross.amount}
-        Payment.objects.get_or_create(
-            variant=CustomPaymentChoices.MANUAL,
-            status=PaymentStatus.CONFIRMED, order=self.order,
-            defaults=defaults)
+        mark_order_as_paid(self.order, self.user)
 
 
 class CancelOrderLineForm(forms.Form):
@@ -389,20 +371,18 @@ class CancelOrderLineForm(forms.Form):
         if self.line.variant and self.line.variant.track_inventory:
             deallocate_stock(self.line.variant, self.line.quantity)
         order = self.line.order
-        self.line.delete()
+        delete_order_line(self.line)
         recalculate_order(order)
 
 
 class ChangeQuantityForm(forms.ModelForm):
     quantity = QuantityField(
-        validators=[MinValueValidator(1)])
+        validators=[MinValueValidator(1)],
+        label=pgettext_lazy('Integer number', 'Quantity'))
 
     class Meta:
         model = OrderLine
         fields = ['quantity']
-        labels = {
-            'quantity': pgettext_lazy(
-                'Integer number', 'Quantity')}
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -419,7 +399,7 @@ class ChangeQuantityForm(forms.ModelForm):
                     'Change quantity form error',
                     'Only %(remaining)d remaining in stock.',
                     'Only %(remaining)d remaining in stock.',
-                    'remaining') % {
+                    number='remaining') % {
                         'remaining': (
                             self.initial_quantity + variant.quantity_available)})  # noqa
         return quantity
@@ -451,7 +431,7 @@ class CancelOrderForm(forms.Form):
             'Cancel order form action',
             'Restock %(quantity)d item',
             'Restock %(quantity)d items',
-            'quantity') % {'quantity': self.order.get_total_quantity()}
+            number='quantity') % {'quantity': self.order.get_total_quantity()}
 
     def clean(self):
         data = super().clean()
@@ -481,7 +461,7 @@ class CancelFulfillmentForm(forms.Form):
             'Cancel fulfillment form action',
             'Restock %(quantity)d item',
             'Restock %(quantity)d items',
-            'quantity') % {'quantity': self.fulfillment.get_total_quantity()}
+            number='quantity') % {'quantity': self.fulfillment.get_total_quantity()}
 
     def clean(self):
         data = super().clean()
@@ -537,13 +517,14 @@ class OrderRemoveVoucherForm(forms.ModelForm):
         decrease_voucher_usage(self.instance.voucher)
         self.instance.discount_amount = 0
         self.instance.discount_name = ''
+        self.instance.translated_discount_name = ''
         self.instance.voucher = None
         recalculate_order(self.instance)
 
 
 PAYMENT_STATUS_CHOICES = (
     [('', pgettext_lazy('Payment status field value', 'All'))] +
-    PaymentStatus.CHOICES)
+    ChargeStatus.CHOICES)
 
 
 class PaymentFilterForm(forms.Form):
@@ -555,8 +536,11 @@ class AddVariantToOrderForm(forms.Form):
 
     variant = AjaxSelect2ChoiceField(
         queryset=ProductVariant.objects.filter(
-            product__in=Product.objects.available_products()),
-        fetch_data_url=reverse_lazy('dashboard:ajax-available-variants'))
+            product__in=Product.objects.published()),
+        fetch_data_url=reverse_lazy('dashboard:ajax-available-variants'),
+        label=pgettext_lazy(
+            'Order form: subform to add variant to order form: variant field',
+            'Variant'))
     quantity = QuantityField(
         label=pgettext_lazy(
             'Add variant to order form label', 'Quantity'),
@@ -600,7 +584,21 @@ class AddVariantToOrderForm(forms.Form):
 
 class AddressForm(StorefrontAddressForm):
     phone = PossiblePhoneNumberFormField(
-        widget=PhonePrefixWidget, required=False)
+        widget=PhonePrefixWidget, required=False,
+        label=pgettext_lazy(
+            'Order form: address subform - phone number input field',
+            'Phone number'))
+
+    def clean(self):
+        data = super().clean()
+        phone = data.get('phone')
+        country = data.get('country')
+        if phone:
+            try:
+                data['phone'] = clean_phone_for_country(phone, country)
+            except forms.ValidationError as error:
+                self.add_error('phone', error)
+        return data
 
 
 class FulfillmentForm(forms.ModelForm):
@@ -633,6 +631,13 @@ class BaseFulfillmentLineFormSet(forms.BaseModelFormSet):
         for form in self.forms:
             form.empty_permitted = False
 
+    def clean(self):
+        total_quantity = sum(
+            form.cleaned_data.get('quantity', 0) for form in self.forms)
+        if total_quantity <= 0:
+            raise forms.ValidationError(
+                'Total quantity must be larger than 0.')
+
 
 class FulfillmentLineForm(forms.ModelForm):
     """Fulfill order line with given quantity by decreasing stock."""
@@ -649,7 +654,7 @@ class FulfillmentLineForm(forms.ModelForm):
                 'Fulfill order line form error',
                 '%(quantity)d item remaining to fulfill.',
                 '%(quantity)d items remaining to fulfill.',
-                'quantity') % {
+                number='quantity') % {
                     'quantity': order_line.quantity_unfulfilled,
                     'order_line': order_line})
         return quantity

@@ -1,18 +1,7 @@
-from django.conf import settings
+import datetime
+
 from django.db import models
-from django.db.models import F, Max
-
-
-class BaseNote(models.Model):
-    user = models.ForeignKey(
-        settings.AUTH_USER_MODEL, blank=True, null=True,
-        on_delete=models.SET_NULL)
-    date = models.DateTimeField(db_index=True, auto_now_add=True)
-    content = models.TextField()
-    is_public = models.BooleanField(default=True)
-
-    class Meta:
-        abstract = True
+from django.db.models import F, Max, Q
 
 
 class SortableModel(models.Model):
@@ -37,3 +26,37 @@ class SortableModel(models.Model):
         qs.filter(sort_order__gt=self.sort_order).update(
             sort_order=F('sort_order') - 1)
         super().delete(*args, **kwargs)
+
+
+class PublishedQuerySet(models.QuerySet):
+
+    def published(self):
+        today = datetime.date.today()
+        return self.filter(
+            Q(publication_date__lte=today) | Q(publication_date__isnull=True),
+            is_published=True)
+
+    @staticmethod
+    def user_has_access_to_all(user):
+        return user.is_active and user.has_perm('product.manage_products')
+
+    def visible_to_user(self, user):
+        if self.user_has_access_to_all(user):
+            return self.all()
+        return self.published()
+
+
+class PublishableModel(models.Model):
+    publication_date = models.DateField(blank=True, null=True)
+    is_published = models.BooleanField(default=True)
+
+    objects = PublishedQuerySet.as_manager()
+
+    class Meta:
+        abstract = True
+
+    @property
+    def is_visible(self):
+        return self.is_published and (
+            self.publication_date is None
+            or self.publication_date < datetime.date.today())

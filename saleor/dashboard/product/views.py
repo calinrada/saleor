@@ -1,3 +1,5 @@
+from datetime import date
+
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import permission_required
@@ -8,21 +10,21 @@ from django.template.response import TemplateResponse
 from django.utils.translation import npgettext_lazy, pgettext_lazy
 from django.views.decorators.http import require_POST
 
-from . import forms
 from ...core.utils import get_paginator_items
 from ...discount.models import Sale
 from ...product.models import (
-    AttributeChoiceValue, Product, ProductAttribute, ProductImage, ProductType,
+    Attribute, AttributeValue, Product, ProductImage, ProductType,
     ProductVariant)
 from ...product.utils.availability import get_availability
 from ...product.utils.costs import (
     get_margin_for_variant, get_product_costs_data)
 from ..views import staff_member_required
-from .filters import ProductAttributeFilter, ProductFilter, ProductTypeFilter
+from . import forms
+from .filters import AttributeFilter, ProductFilter, ProductTypeFilter
 
 
 @staff_member_required
-@permission_required('product.view_product')
+@permission_required('product.manage_products')
 def product_list(request):
     products = Product.objects.prefetch_related('images')
     products = products.order_by('name')
@@ -40,7 +42,7 @@ def product_list(request):
 
 
 @staff_member_required
-@permission_required('product.view_product')
+@permission_required('product.manage_products')
 def product_details(request, pk):
     products = Product.objects.prefetch_related('variants', 'images').all()
     product = get_object_or_404(products, pk=pk)
@@ -68,7 +70,7 @@ def product_details(request, pk):
 
 @require_POST
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def product_toggle_is_published(request, pk):
     product = get_object_or_404(Product, pk=pk)
     product.is_published = not product.is_published
@@ -78,7 +80,7 @@ def product_toggle_is_published(request, pk):
 
 
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def product_select_type(request):
     """View for add product modal embedded in the product list view."""
     form = forms.ProductTypeSelectorForm(request.POST or None)
@@ -98,7 +100,7 @@ def product_select_type(request):
 
 
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def product_create(request, type_pk):
     track_inventory = request.site.settings.track_inventory_by_default
     product_type = get_object_or_404(ProductType, pk=type_pk)
@@ -133,7 +135,7 @@ def product_create(request, type_pk):
 
 
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def product_edit(request, pk):
     product = get_object_or_404(
         Product.objects.prefetch_related('variants'), pk=pk)
@@ -163,7 +165,7 @@ def product_edit(request, pk):
 
 
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def product_delete(request, pk):
     product = get_object_or_404(Product, pk=pk)
     if request.method == 'POST':
@@ -180,7 +182,7 @@ def product_delete(request, pk):
 
 @require_POST
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def product_bulk_update(request):
     form = forms.ProductBulkUpdate(request.POST)
     if form.is_valid():
@@ -190,7 +192,7 @@ def product_bulk_update(request):
             'Dashboard message',
             '%(count)d product has been updated',
             '%(count)d products have been updated',
-            number=count) % {'count': count}
+            number='count') % {'count': count}
         messages.success(request, msg)
     return redirect('dashboard:product-list')
 
@@ -202,8 +204,9 @@ def ajax_products_list(request):
     Response format is that of a Select2 JS widget.
     """
     queryset = (
-        Product.objects.all() if request.user.has_perm('product.view_product')
-        else Product.objects.available_products())
+        Product.objects.all()
+        if request.user.has_perm('product.manage_products')
+        else Product.objects.published())
     search_query = request.GET.get('q', '')
     if search_query:
         queryset = queryset.filter(Q(name__icontains=search_query))
@@ -213,7 +216,7 @@ def ajax_products_list(request):
 
 
 @staff_member_required
-@permission_required('product.view_properties')
+@permission_required('product.manage_products')
 def product_type_list(request):
     types = ProductType.objects.all().prefetch_related(
         'product_attributes', 'variant_attributes').order_by('name')
@@ -234,7 +237,7 @@ def product_type_list(request):
 
 
 @staff_member_required
-@permission_required('product.edit_properties')
+@permission_required('product.manage_products')
 def product_type_create(request):
     product_type = ProductType()
     form = forms.ProductTypeForm(request.POST or None, instance=product_type)
@@ -252,11 +255,10 @@ def product_type_create(request):
 
 
 @staff_member_required
-@permission_required('product.edit_properties')
+@permission_required('product.manage_products')
 def product_type_edit(request, pk):
     product_type = get_object_or_404(ProductType, pk=pk)
-    form = forms.ProductTypeForm(
-        request.POST or None, instance=product_type)
+    form = forms.ProductTypeForm(request.POST or None, instance=product_type)
     if form.is_valid():
         product_type = form.save()
         msg = pgettext_lazy(
@@ -271,7 +273,7 @@ def product_type_edit(request, pk):
 
 
 @staff_member_required
-@permission_required('product.edit_properties')
+@permission_required('product.manage_products')
 def product_type_delete(request, pk):
     product_type = get_object_or_404(ProductType, pk=pk)
     if request.method == 'POST':
@@ -290,7 +292,7 @@ def product_type_delete(request, pk):
 
 
 @staff_member_required
-@permission_required('product.view_product')
+@permission_required('product.manage_products')
 def variant_details(request, product_pk, variant_pk):
     product = get_object_or_404(Product, pk=product_pk)
     variant = get_object_or_404(product.variants.all(), pk=variant_pk)
@@ -302,7 +304,8 @@ def variant_details(request, product_pk, variant_pk):
 
     images = variant.images.all()
     margin = get_margin_for_variant(variant)
-    discounted_price = variant.get_price(discounts=Sale.objects.all()).gross
+    discounted_price = variant.get_price(
+        discounts=Sale.objects.active(date.today())).gross
     ctx = {
         'images': images, 'product': product, 'variant': variant,
         'margin': margin, 'discounted_price': discounted_price}
@@ -313,7 +316,7 @@ def variant_details(request, product_pk, variant_pk):
 
 
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def variant_create(request, product_pk):
     track_inventory = request.site.settings.track_inventory_by_default
     product = get_object_or_404(Product.objects.all(), pk=product_pk)
@@ -337,7 +340,7 @@ def variant_create(request, product_pk):
 
 
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def variant_edit(request, product_pk, variant_pk):
     product = get_object_or_404(Product.objects.all(), pk=product_pk)
     variant = get_object_or_404(product.variants.all(), pk=variant_pk)
@@ -358,7 +361,7 @@ def variant_edit(request, product_pk, variant_pk):
 
 
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def variant_delete(request, product_pk, variant_pk):
     product = get_object_or_404(Product, pk=product_pk)
     variant = get_object_or_404(product.variants, pk=variant_pk)
@@ -378,7 +381,7 @@ def variant_delete(request, product_pk, variant_pk):
 
 
 @staff_member_required
-@permission_required('product.view_product')
+@permission_required('product.manage_products')
 def variant_images(request, product_pk, variant_pk):
     product = get_object_or_404(Product, pk=product_pk)
     qs = product.variants.prefetch_related('images')
@@ -402,7 +405,7 @@ def ajax_available_variants_list(request):
 
     Response format is that of a Select2 JS widget.
     """
-    available_products = Product.objects.available_products().prefetch_related(
+    available_products = Product.objects.published().prefetch_related(
         'category',
         'product_type__product_attributes')
     queryset = ProductVariant.objects.filter(
@@ -424,7 +427,7 @@ def ajax_available_variants_list(request):
 
 
 @staff_member_required
-@permission_required('product.view_product')
+@permission_required('product.manage_products')
 def product_images(request, product_pk):
     products = Product.objects.prefetch_related('images')
     product = get_object_or_404(products, pk=product_pk)
@@ -436,7 +439,7 @@ def product_images(request, product_pk):
 
 
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def product_image_create(request, product_pk):
     product = get_object_or_404(Product, pk=product_pk)
     product_image = ProductImage(product=product)
@@ -457,7 +460,7 @@ def product_image_create(request, product_pk):
 
 
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def product_image_edit(request, product_pk, img_pk):
     product = get_object_or_404(Product, pk=product_pk)
     product_image = get_object_or_404(product.images, pk=img_pk)
@@ -478,7 +481,7 @@ def product_image_edit(request, product_pk, img_pk):
 
 
 @staff_member_required
-@permission_required('product.edit_product')
+@permission_required('product.manage_products')
 def product_image_delete(request, product_pk, img_pk):
     product = get_object_or_404(Product, pk=product_pk)
     image = get_object_or_404(product.images, pk=img_pk)
@@ -527,145 +530,151 @@ def ajax_upload_image(request, product_pk):
 
 
 @staff_member_required
-@permission_required('product.view_properties')
+@permission_required('product.manage_products')
 def attribute_list(request):
-    attributes = (ProductAttribute.objects.prefetch_related('values')
-                  .order_by('name'))
-    attribute_filter = ProductAttributeFilter(request.GET, queryset=attributes)
-    attributes = [
-        (attribute.pk, attribute.name, attribute.values.all())
-        for attribute in attribute_filter.qs]
+    attributes = (
+        Attribute.objects.prefetch_related(
+            'values', 'product_type', 'product_variant_type').order_by('name'))
+    attribute_filter = AttributeFilter(request.GET, queryset=attributes)
+    attributes = [(
+        attribute.pk, attribute.name,
+        attribute.product_type or attribute.product_variant_type,
+        attribute.values.all()) for attribute in attribute_filter.qs]
     attributes = get_paginator_items(
         attributes, settings.DASHBOARD_PAGINATE_BY, request.GET.get('page'))
     ctx = {
-        'attributes': attributes, 'filter_set': attribute_filter,
+        'attributes': attributes,
+        'filter_set': attribute_filter,
         'is_empty': not attribute_filter.queryset.exists()}
     return TemplateResponse(
-        request, 'dashboard/product/product_attribute/list.html', ctx)
+        request, 'dashboard/product/attribute/list.html', ctx)
 
 
 @staff_member_required
-@permission_required('product.view_properties')
+@permission_required('product.manage_products')
 def attribute_details(request, pk):
-    attributes = ProductAttribute.objects.prefetch_related('values').all()
+    attributes = Attribute.objects.prefetch_related(
+        'values', 'product_type', 'product_variant_type').all()
     attribute = get_object_or_404(attributes, pk=pk)
+    product_type = attribute.product_type or attribute.product_variant_type
     values = attribute.values.all()
-    ctx = {'attribute': attribute, 'values': values}
+    ctx = {
+        'attribute': attribute, 'product_type': product_type, 'values': values}
     return TemplateResponse(
-        request, 'dashboard/product/product_attribute/detail.html', ctx)
+        request, 'dashboard/product/attribute/detail.html', ctx)
 
 
 @staff_member_required
-@permission_required('product.edit_properties')
+@permission_required('product.manage_products')
 def attribute_create(request):
-    attribute = ProductAttribute()
-    form = forms.ProductAttributeForm(request.POST or None, instance=attribute)
+    attribute = Attribute()
+    form = forms.AttributeForm(request.POST or None, instance=attribute)
     if form.is_valid():
         attribute = form.save()
         msg = pgettext_lazy('Dashboard message', 'Added attribute')
         messages.success(request, msg)
-        return redirect('dashboard:product-attribute-details', pk=attribute.pk)
+        return redirect('dashboard:attribute-details', pk=attribute.pk)
     ctx = {'attribute': attribute, 'form': form}
     return TemplateResponse(
         request,
-        'dashboard/product/product_attribute/form.html',
+        'dashboard/product/attribute/form.html',
         ctx)
 
 
 @staff_member_required
-@permission_required('product.edit_properties')
+@permission_required('product.manage_products')
 def attribute_edit(request, pk):
-    attribute = get_object_or_404(ProductAttribute, pk=pk)
-    form = forms.ProductAttributeForm(request.POST or None, instance=attribute)
+    attribute = get_object_or_404(Attribute, pk=pk)
+    form = forms.AttributeForm(request.POST or None, instance=attribute)
     if form.is_valid():
         attribute = form.save()
         msg = pgettext_lazy('Dashboard message', 'Updated attribute')
         messages.success(request, msg)
-        return redirect('dashboard:product-attribute-details', pk=attribute.pk)
+        return redirect('dashboard:attribute-details', pk=attribute.pk)
     ctx = {'attribute': attribute, 'form': form}
     return TemplateResponse(
         request,
-        'dashboard/product/product_attribute/form.html',
+        'dashboard/product/attribute/form.html',
         ctx)
 
 
 @staff_member_required
-@permission_required('product.edit_properties')
+@permission_required('product.manage_products')
 def attribute_delete(request, pk):
-    attribute = get_object_or_404(ProductAttribute, pk=pk)
+    attribute = get_object_or_404(Attribute, pk=pk)
     if request.method == 'POST':
         attribute.delete()
         msg = pgettext_lazy(
             'Dashboard message', 'Removed attribute %s') % (attribute.name,)
         messages.success(request, msg)
-        return redirect('dashboard:product-attributes')
+        return redirect('dashboard:attributes')
     return TemplateResponse(
         request,
-        'dashboard/product/product_attribute/modal/'
+        'dashboard/product/attribute/modal/'
         'attribute_confirm_delete.html',
         {'attribute': attribute})
 
 
 @staff_member_required
-@permission_required('product.edit_properties')
-def attribute_choice_value_create(request, attribute_pk):
-    attribute = get_object_or_404(ProductAttribute, pk=attribute_pk)
-    value = AttributeChoiceValue(attribute_id=attribute_pk)
-    form = forms.AttributeChoiceValueForm(request.POST or None, instance=value)
+@permission_required('product.manage_products')
+def attribute_value_create(request, attribute_pk):
+    attribute = get_object_or_404(Attribute, pk=attribute_pk)
+    value = AttributeValue(attribute_id=attribute_pk)
+    form = forms.AttributeValueForm(request.POST or None, instance=value)
     if form.is_valid():
         form.save()
         msg = pgettext_lazy(
             'Dashboard message', 'Added attribute\'s value')
         messages.success(request, msg)
-        return redirect('dashboard:product-attribute-details', pk=attribute_pk)
+        return redirect('dashboard:attribute-details', pk=attribute_pk)
     ctx = {'attribute': attribute, 'value': value, 'form': form}
     return TemplateResponse(
         request,
-        'dashboard/product/product_attribute/values/form.html',
+        'dashboard/product/attribute/values/form.html',
         ctx)
 
 
 @staff_member_required
-@permission_required('product.edit_properties')
-def attribute_choice_value_edit(request, attribute_pk, value_pk):
-    attribute = get_object_or_404(ProductAttribute, pk=attribute_pk)
-    value = get_object_or_404(AttributeChoiceValue, pk=value_pk)
-    form = forms.AttributeChoiceValueForm(request.POST or None, instance=value)
+@permission_required('product.manage_products')
+def attribute_value_edit(request, attribute_pk, value_pk):
+    attribute = get_object_or_404(Attribute, pk=attribute_pk)
+    value = get_object_or_404(AttributeValue, pk=value_pk)
+    form = forms.AttributeValueForm(request.POST or None, instance=value)
     if form.is_valid():
         form.save()
         msg = pgettext_lazy(
             'Dashboard message', 'Updated attribute\'s value')
         messages.success(request, msg)
-        return redirect('dashboard:product-attribute-details', pk=attribute_pk)
+        return redirect('dashboard:attribute-details', pk=attribute_pk)
     ctx = {'attribute': attribute, 'value': value, 'form': form}
     return TemplateResponse(
         request,
-        'dashboard/product/product_attribute/values/form.html',
+        'dashboard/product/attribute/values/form.html',
         ctx)
 
 
 @staff_member_required
-@permission_required('product.edit_properties')
-def attribute_choice_value_delete(request, attribute_pk, value_pk):
-    value = get_object_or_404(AttributeChoiceValue, pk=value_pk)
+@permission_required('product.manage_products')
+def attribute_value_delete(request, attribute_pk, value_pk):
+    value = get_object_or_404(AttributeValue, pk=value_pk)
     if request.method == 'POST':
         value.delete()
         msg = pgettext_lazy(
             'Dashboard message',
             'Removed attribute\'s value %s') % (value.name,)
         messages.success(request, msg)
-        return redirect('dashboard:product-attribute-details', pk=attribute_pk)
+        return redirect('dashboard:attribute-details', pk=attribute_pk)
     return TemplateResponse(
         request,
-        'dashboard/product/product_attribute/values/modal/confirm_delete.html',
+        'dashboard/product/attribute/values/modal/confirm_delete.html',
         {'value': value, 'attribute_pk': attribute_pk})
 
 
 @staff_member_required
-@permission_required('product.edit_properties')
-def ajax_reorder_attribute_choice_values(request, attribute_pk):
-    attribute = get_object_or_404(ProductAttribute, pk=attribute_pk)
-    form = forms.ReorderAttributeChoiceValuesForm(
+@permission_required('product.manage_products')
+def ajax_reorder_attribute_values(request, attribute_pk):
+    attribute = get_object_or_404(Attribute, pk=attribute_pk)
+    form = forms.ReorderAttributeValuesForm(
         request.POST, instance=attribute)
     status = 200
     ctx = {}

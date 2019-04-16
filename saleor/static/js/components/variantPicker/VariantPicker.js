@@ -2,7 +2,8 @@ import _ from 'lodash';
 import $ from 'jquery';
 import classNames from 'classnames';
 import { observer } from 'mobx-react';
-import React, { Component, PropTypes } from 'react';
+import React, { Component } from 'react';
+import PropTypes from 'prop-types';
 
 import AttributeSelectionWidget from './AttributeSelectionWidget';
 import QuantityInput from './QuantityInput';
@@ -138,7 +139,7 @@ export default observer(class VariantPicker extends Component {
     const disableAddToCart = store.isEmpty || !this.checkVariantAvailability();
 
     const addToCartBtnClasses = classNames({
-      'btn primary': true,
+      'btn btn-primary': true,
       'disabled': disableAddToCart
     });
 

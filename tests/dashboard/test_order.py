@@ -1,32 +1,74 @@
-from unittest.mock import Mock
+import json
+from decimal import Decimal
 
 import pytest
-from django.conf import settings
 from django.urls import reverse
-from payments import PaymentStatus
 from prices import Money
-from tests.utils import get_form_errors, get_redirect_location
 
 from saleor.checkout import AddressType
 from saleor.core.utils.taxes import ZERO_MONEY, ZERO_TAXED_MONEY
-from saleor.dashboard.order.forms import ChangeQuantityForm, OrderNoteForm
+from saleor.dashboard.order.forms import ChangeQuantityForm
 from saleor.dashboard.order.utils import (
-    fulfill_order_line, remove_customer_from_order, save_address_in_order,
+    remove_customer_from_order, save_address_in_order,
     update_order_with_user_addresses)
 from saleor.discount.utils import increase_voucher_usage
-from saleor.order import FulfillmentStatus, OrderStatus
-from saleor.order.models import Order, OrderLine, OrderNote
+from saleor.order import (
+    FulfillmentStatus, OrderEvents, OrderEventsEmails, OrderStatus)
+from saleor.order.models import Order, OrderEvent, OrderLine
 from saleor.order.utils import add_variant_to_order, change_order_line_quantity
+from saleor.payment import ChargeStatus, TransactionKind
 from saleor.product.models import ProductVariant
+from saleor.shipping.models import ShippingZone
+from tests.utils import get_form_errors, get_redirect_location
+
+
+def test_ajax_order_shipping_methods_list(
+        admin_client, order, shipping_zone):
+    method = shipping_zone.shipping_methods.get()
+    shipping_methods_list = [
+        {'id': method.pk, 'text': method.get_ajax_label()}]
+    url = reverse(
+        'dashboard:ajax-order-shipping-methods', kwargs={'order_pk': order.pk})
+
+    response = admin_client.get(url, HTTP_X_REQUESTED_WITH='XMLHttpRequest')
+    resp_decoded = json.loads(response.content.decode('utf-8'))
+
+    assert response.status_code == 200
+    assert resp_decoded == {'results': shipping_methods_list}
+
+
+def test_ajax_order_shipping_methods_list_different_country(
+        admin_client, order, settings, shipping_zone):
+    order.shipping_address = order.billing_address.get_copy()
+    order.save()
+    method = shipping_zone.shipping_methods.get()
+    shipping_methods_list = [
+        {'id': method.pk, 'text': method.get_ajax_label()}]
+    # If shipping zone does not cover order's country,
+    # then its shipping methods should not be included
+    assert order.shipping_address.country.code != 'DE'
+    zone = ShippingZone.objects.create(name='Shipping zone', countries=['DE'])
+    zone.shipping_methods.create(
+        price=Money(15, settings.DEFAULT_CURRENCY), name='DHL')
+
+    url = reverse(
+        'dashboard:ajax-order-shipping-methods', kwargs={'order_pk': order.pk})
+
+    response = admin_client.get(url, HTTP_X_REQUESTED_WITH='XMLHttpRequest')
+    resp_decoded = json.loads(response.content.decode('utf-8'))
+
+    assert response.status_code == 200
+    assert resp_decoded == {'results': shipping_methods_list}
 
 
 @pytest.mark.integration
 def test_view_capture_order_payment_preauth(
-        admin_client, order_with_lines, payment_preauth):
+        admin_client, order_with_lines, payment_txn_preauth):
     order = order_with_lines
+    payment = payment_txn_preauth
     url = reverse(
         'dashboard:capture-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_preauth.pk})
+            'order_pk': order.pk, 'payment_pk': payment.pk})
     response = admin_client.get(url)
     assert response.status_code == 200
 
@@ -35,111 +77,69 @@ def test_view_capture_order_payment_preauth(
             'csrfmiddlewaretoken': 'hello',
             'amount': str(order.total.gross.amount)})
     assert response.status_code == 302
-    assert order.payments.last().status == PaymentStatus.CONFIRMED
-    assert order.payments.last().get_captured_price() == order.total.gross
-
-
-@pytest.mark.integration
-def test_view_capture_order_invalid_payment_waiting_status(
-        admin_client, order_with_lines, payment_waiting):
-    order = order_with_lines
-    url = reverse(
-        'dashboard:capture-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_waiting.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(
-        url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.WAITING
+    payment = order.payments.last()
+    assert payment.charge_status == ChargeStatus.FULLY_CHARGED
+    assert payment.captured_amount == order.total.gross.amount
+    assert payment.currency == order.total.gross.currency
 
 
 @pytest.mark.integration
 def test_view_capture_order_invalid_payment_confirmed_status(
-        admin_client, order_with_lines, payment_confirmed):
+        admin_client, order_with_lines, payment_txn_captured):
     order = order_with_lines
     url = reverse(
         'dashboard:capture-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_confirmed.pk})
+            'order_pk': order.pk, 'payment_pk': payment_txn_captured.pk})
     response = admin_client.get(url)
     assert response.status_code == 200
 
     response = admin_client.post(
         url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
     assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.CONFIRMED
+    payment = order.payments.last()
+    assert payment.charge_status == ChargeStatus.FULLY_CHARGED
 
 
 @pytest.mark.integration
 def test_view_capture_order_invalid_payment_rejected_status(
-        admin_client, order_with_lines, payment_rejected):
-    order = order_with_lines
+        admin_client, payment_not_authorized):
+    order = payment_not_authorized.order
     url = reverse(
         'dashboard:capture-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_rejected.pk})
+            'order_pk': order.pk,
+            'payment_pk': payment_not_authorized.pk})
     response = admin_client.get(url)
     assert response.status_code == 200
 
     response = admin_client.post(
         url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
     assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.REJECTED
+    payment = order.payments.last()
+    assert payment.charge_status == ChargeStatus.NOT_CHARGED
 
 
 @pytest.mark.integration
 def test_view_capture_order_invalid_payment_refunded_status(
-        admin_client, order_with_lines, payment_refunded):
+        admin_client, order_with_lines, payment_txn_refunded):
     order = order_with_lines
     url = reverse(
         'dashboard:capture-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_refunded.pk})
+            'order_pk': order.pk, 'payment_pk': payment_txn_refunded.pk})
     response = admin_client.get(url)
     assert response.status_code == 200
 
     response = admin_client.post(
         url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
     assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.REFUNDED
-
-
-@pytest.mark.integration
-def test_view_capture_order_invalid_payment_error_status(
-        admin_client, order_with_lines, payment_error):
-    order = order_with_lines
-    url = reverse(
-        'dashboard:capture-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_error.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(
-        url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.ERROR
-
-
-@pytest.mark.integration
-def test_view_capture_order_invalid_payment_input_status(
-        admin_client, order_with_lines, payment_input):
-    order = order_with_lines
-    url = reverse(
-        'dashboard:capture-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_input.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(
-        url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.INPUT
+    payment = order.payments.last()
+    assert payment.charge_status == ChargeStatus.FULLY_REFUNDED
 
 
 @pytest.mark.integration
 def test_view_refund_order_payment_confirmed(
-        admin_client, order_with_lines, payment_confirmed):
+        admin_client, order_with_lines, payment_txn_captured):
     order = order_with_lines
-
+    payment_confirmed = payment_txn_captured
     url = reverse(
         'dashboard:refund-payment', kwargs={
             'order_pk': order.pk, 'payment_pk': payment_confirmed.pk})
@@ -151,230 +151,108 @@ def test_view_refund_order_payment_confirmed(
             'csrfmiddlewaretoken': 'hello',
             'amount': str(payment_confirmed.captured_amount)})
     assert response.status_code == 302
-    assert order.payments.last().status == PaymentStatus.REFUNDED
-    assert order.payments.last().get_captured_price() == Money(0, 'USD')
-
-
-@pytest.mark.integration
-def test_view_refund_order_invalid_payment_waiting_status(
-        admin_client, order_with_lines, payment_waiting):
-    order = order_with_lines
-
-    url = reverse(
-        'dashboard:refund-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_waiting.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(
-        url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.WAITING
+    payment = order.payments.last()
+    assert payment.charge_status == ChargeStatus.FULLY_REFUNDED
+    assert payment.captured_amount == Decimal('0.00')
 
 
 @pytest.mark.integration
 def test_view_refund_order_invalid_payment_preauth_status(
-        admin_client, order_with_lines, payment_preauth):
+        admin_client, order_with_lines, payment_txn_preauth):
     order = order_with_lines
 
     url = reverse(
         'dashboard:refund-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_preauth.pk})
+            'order_pk': order.pk, 'payment_pk': payment_txn_preauth.pk})
     response = admin_client.get(url)
     assert response.status_code == 200
 
     response = admin_client.post(
         url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
     assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.PREAUTH
-
-
-@pytest.mark.integration
-def test_view_refund_order_invalid_payment_rejected_status(
-        admin_client, order_with_lines, payment_rejected):
-    order = order_with_lines
-
-    url = reverse(
-        'dashboard:refund-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_rejected.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(
-        url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.REJECTED
+    payment = order.payments.last()
+    assert payment.charge_status == ChargeStatus.NOT_CHARGED
 
 
 @pytest.mark.integration
 def test_view_refund_order_invalid_payment_refunded_status(
-        admin_client, order_with_lines, payment_refunded):
+        admin_client, order_with_lines, payment_txn_refunded):
     order = order_with_lines
 
     url = reverse(
         'dashboard:refund-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_refunded.pk})
+            'order_pk': order.pk, 'payment_pk': payment_txn_refunded.pk})
     response = admin_client.get(url)
     assert response.status_code == 200
 
     response = admin_client.post(
         url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
     assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.REFUNDED
+    payment = order.payments.last()
+    assert payment.charge_status == ChargeStatus.FULLY_REFUNDED
 
 
 @pytest.mark.integration
-def test_view_refund_order_invalid_payment_error_status(
-        admin_client, order_with_lines, payment_error):
+def test_view_void_order_payment_preauth(
+        admin_client, order_with_lines, payment_txn_preauth):
     order = order_with_lines
 
     url = reverse(
-        'dashboard:refund-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_error.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(
-        url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.ERROR
-
-
-@pytest.mark.integration
-def test_view_refund_order_invalid_payment_input_status(
-        admin_client, order_with_lines, payment_input):
-    order = order_with_lines
-
-    url = reverse(
-        'dashboard:refund-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_input.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(
-        url, {'csrfmiddlewaretoken': 'hello', 'amount': '20.00'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.INPUT
-
-
-@pytest.mark.integration
-def test_view_release_order_payment_preauth(
-        admin_client, order_with_lines, payment_preauth):
-    order = order_with_lines
-
-    url = reverse(
-        'dashboard:release-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_preauth.pk})
+        'dashboard:void-payment', kwargs={
+            'order_pk': order.pk, 'payment_pk': payment_txn_preauth.pk})
     response = admin_client.get(url)
     assert response.status_code == 200
 
     response = admin_client.post(url, {
         'csrfmiddlewaretoken': 'hello'})
     assert response.status_code == 302
-    assert order.payments.last().status == PaymentStatus.REFUNDED
-    assert order.payments.last().get_captured_price() == Money(0, 'USD')
+    order_payment = order.payments.last()
+    assert order_payment.charge_status == ChargeStatus.NOT_CHARGED
+    last_transaction = order_payment.transactions.latest('pk')
+
+    assert last_transaction.kind == TransactionKind.VOID
+    assert order_payment.captured_amount == Decimal('0.00')
+
 
 
 @pytest.mark.integration
-def test_view_release_order_invalid_payment_waiting_status(
-        admin_client, order_with_lines, payment_waiting):
+def test_view_void_order_invalid_payment_confirmed_status(
+        admin_client, order_with_lines, payment_txn_captured):
     order = order_with_lines
 
     url = reverse(
-        'dashboard:release-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_waiting.pk})
+        'dashboard:void-payment', kwargs={
+            'order_pk': order.pk, 'payment_pk': payment_txn_captured.pk})
     response = admin_client.get(url)
     assert response.status_code == 200
 
     response = admin_client.post(url, {
         'csrfmiddlewaretoken': 'hello'})
     assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.WAITING
+    order_payment = order.payments.last()
+    assert order_payment.charge_status == ChargeStatus.FULLY_CHARGED
+    assert order_payment.captured_amount == order.total.gross.amount
+    assert order_payment.total == order.total.gross.amount
+    assert order_payment.currency == order.total.gross.currency
 
 
 @pytest.mark.integration
-def test_view_release_order_invalid_payment_confirmed_status(
-        admin_client, order_with_lines, payment_confirmed):
+def test_view_void_order_invalid_payment_refunded_status(
+        admin_client, order_with_lines, payment_txn_refunded):
     order = order_with_lines
 
     url = reverse(
-        'dashboard:release-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_confirmed.pk})
+        'dashboard:void-payment', kwargs={
+            'order_pk': order.pk, 'payment_pk': payment_txn_refunded.pk})
     response = admin_client.get(url)
     assert response.status_code == 200
 
     response = admin_client.post(url, {
         'csrfmiddlewaretoken': 'hello'})
     assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.CONFIRMED
-
-
-@pytest.mark.integration
-def test_view_release_order_invalid_payment_rejected_status(
-        admin_client, order_with_lines, payment_rejected):
-    order = order_with_lines
-
-    url = reverse(
-        'dashboard:release-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_rejected.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(url, {
-        'csrfmiddlewaretoken': 'hello'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.REJECTED
-
-
-@pytest.mark.integration
-def test_view_release_order_invalid_payment_refunded_status(
-        admin_client, order_with_lines, payment_refunded):
-    order = order_with_lines
-
-    url = reverse(
-        'dashboard:release-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_refunded.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(url, {
-        'csrfmiddlewaretoken': 'hello'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.REFUNDED
-
-
-@pytest.mark.integration
-def test_view_release_order_invalid_payment_error_status(
-        admin_client, order_with_lines, payment_error):
-    order = order_with_lines
-
-    url = reverse(
-        'dashboard:release-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_error.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(url, {
-        'csrfmiddlewaretoken': 'hello'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.ERROR
-
-
-@pytest.mark.integration
-def test_view_release_order_invalid_payment_input_status(
-        admin_client, order_with_lines, payment_input):
-    order = order_with_lines
-
-    url = reverse(
-        'dashboard:release-payment', kwargs={
-            'order_pk': order.pk, 'payment_pk': payment_input.pk})
-    response = admin_client.get(url)
-    assert response.status_code == 200
-
-    response = admin_client.post(url, {
-        'csrfmiddlewaretoken': 'hello'})
-    assert response.status_code == 400
-    assert order.payments.last().status == PaymentStatus.INPUT
+    payment = order.payments.last()
+    assert payment.charge_status == ChargeStatus.FULLY_REFUNDED
+    assert payment.captured_amount == Decimal('0.00')
 
 
 @pytest.mark.integration
@@ -478,8 +356,8 @@ def test_view_change_order_line_quantity_with_invalid_data(
     assert response.status_code == 400
 
 
-def test_dashboard_change_quantity_form(request_cart_with_item, order):
-    for line in request_cart_with_item:
+def test_dashboard_change_quantity_form(request_checkout_with_item, order):
+    for line in request_checkout_with_item:
         add_variant_to_order(order, line.variant, line.quantity)
     order_line = order.lines.get()
     quantity_before = order_line.variant.quantity_allocated
@@ -526,7 +404,7 @@ def test_dashboard_change_quantity_form(request_cart_with_item, order):
 
 
 def test_ordered_item_change_quantity(transactional_db, order_with_lines):
-    assert not order_with_lines.history.count()
+    assert not order_with_lines.events.count()
     lines = order_with_lines.lines.all()
     change_order_line_quantity(lines[1], 0)
     change_order_line_quantity(lines[0], 0)
@@ -603,57 +481,6 @@ def test_view_add_variant_to_order(admin_client, order_with_lines):
     assert get_redirect_location(response) == reverse(
         'dashboard:order-details', kwargs={'order_pk': order_with_lines.pk})
     assert line.quantity == line_quantity_before + added_quantity
-
-
-def test_note_form_sent_email(monkeypatch, order_with_lines):
-    mock_send_mail = Mock(return_value=None)
-    monkeypatch.setattr(
-        'saleor.dashboard.order.forms.send_note_confirmation', mock_send_mail)
-    note = OrderNote(order=order_with_lines, user=order_with_lines.user)
-    form = OrderNoteForm({'content': 'test_note'}, instance=note)
-    form.send_confirmation_email()
-    assert mock_send_mail.called_once()
-
-
-def test_fulfill_order_line(order_with_lines):
-    order = order_with_lines
-    line = order.lines.first()
-    quantity_fulfilled_before = line.quantity_fulfilled
-    variant = line.variant
-    stock_quantity_after = variant.quantity - line.quantity
-
-    fulfill_order_line(line, line.quantity)
-
-    variant.refresh_from_db()
-    assert variant.quantity == stock_quantity_after
-    assert line.quantity_fulfilled == quantity_fulfilled_before + line.quantity
-
-
-def test_fulfill_order_line_with_variant_deleted(order_with_lines):
-    line = order_with_lines.lines.first()
-    line.variant.delete()
-
-    line.refresh_from_db()
-
-    fulfill_order_line(line, line.quantity)
-
-
-def test_fulfill_order_line_without_inventory_tracking(order_with_lines):
-    order = order_with_lines
-    line = order.lines.first()
-    quantity_fulfilled_before = line.quantity_fulfilled
-    variant = line.variant
-    variant.track_inventory = False
-    variant.save()
-
-    # stock should not change
-    stock_quantity_after = variant.quantity
-
-    fulfill_order_line(line, line.quantity)
-
-    variant.refresh_from_db()
-    assert variant.quantity == stock_quantity_after
-    assert line.quantity_fulfilled == quantity_fulfilled_before + line.quantity
 
 
 def test_view_change_fulfillment_tracking(admin_client, fulfilled_order):
@@ -747,16 +574,21 @@ def test_view_create_from_draft_order_not_draft_order(
     assert response.status_code == 404
 
 
-def test_view_create_from_draft_order_shipping_method_not_valid(
-        admin_client, draft_order, shipping_method):
-    method = shipping_method.price_per_country.create(
-        country_code='DE', price=10)
+def test_view_create_from_draft_order_shipping_zone_not_valid(
+        admin_client, draft_order, settings, shipping_zone):
+    method = shipping_zone.shipping_methods.create(
+        name='DHL', price=Money(10, settings.DEFAULT_CURRENCY))
+    shipping_zone.countries = ['DE']
+    shipping_zone.save()
+    # Shipping zone is not valid, as shipping address is listed outside the
+    # shipping zone's countries
+    assert draft_order.shipping_address.country.code != 'DE'
     draft_order.shipping_method = method
     draft_order.save()
     url = reverse(
         'dashboard:create-order-from-draft',
         kwargs={'order_pk': draft_order.pk})
-    data = {'csrfmiddlewaretoken': 'hello'}
+    data = {'shipping_method': method.pk}
 
     response = admin_client.post(url, data)
 
@@ -885,9 +717,9 @@ def test_view_order_customer_remove(admin_client, draft_order):
 
 
 def test_view_order_shipping_edit(
-        admin_client, draft_order, shipping_method, settings, vatlayer):
-    method = shipping_method.price_per_country.create(
-        price=Money(5, settings.DEFAULT_CURRENCY), country_code='PL')
+        admin_client, draft_order, shipping_zone, settings, vatlayer):
+    method = shipping_zone.shipping_methods.create(
+        price=Money(5, settings.DEFAULT_CURRENCY), name='DHL')
     url = reverse(
         'dashboard:order-shipping-edit', kwargs={'order_pk': draft_order.pk})
     data = {'shipping_method': method.pk}
@@ -899,15 +731,15 @@ def test_view_order_shipping_edit(
         'dashboard:order-details', kwargs={'order_pk': draft_order.pk})
     assert get_redirect_location(response) == redirect_url
     draft_order.refresh_from_db()
-    assert draft_order.shipping_method_name == shipping_method.name
-    assert draft_order.shipping_price == method.get_total_price(taxes=vatlayer)
+    assert draft_order.shipping_method_name == method.name
+    assert draft_order.shipping_price == method.get_total(taxes=vatlayer)
     assert draft_order.shipping_method == method
 
 
 def test_view_order_shipping_edit_not_draft_order(
-        admin_client, order_with_lines, shipping_method):
-    method = shipping_method.price_per_country.create(
-        price=5, country_code='PL')
+        admin_client, order_with_lines, settings, shipping_zone):
+    method = shipping_zone.shipping_methods.create(
+        price=Money(5, settings.DEFAULT_CURRENCY), name='DHL')
     url = reverse(
         'dashboard:order-shipping-edit',
         kwargs={'order_pk': order_with_lines.pk})
@@ -1055,7 +887,7 @@ def test_remove_customer_from_order_do_not_remove_modified_addresses(
     assert order.shipping_address == old_shipping_address
 
 
-def test_view_order_voucher_edit(admin_client, draft_order, voucher):
+def test_view_order_voucher_edit(admin_client, draft_order, settings, voucher):
     total_before = draft_order.total
     url = reverse(
         'dashboard:order-voucher-edit', kwargs={'order_pk': draft_order.pk})
@@ -1074,7 +906,7 @@ def test_view_order_voucher_edit(admin_client, draft_order, voucher):
     assert draft_order.total == total_before - discount_amount
 
 
-def test_view_order_voucher_remove(admin_client, draft_order, voucher):
+def test_view_order_voucher_remove(admin_client, draft_order, settings, voucher):
     increase_voucher_usage(voucher)
     draft_order.voucher = voucher
     discount_amount = Money(voucher.discount_value, settings.DEFAULT_CURRENCY)
@@ -1113,8 +945,8 @@ def test_view_mark_order_as_paid(admin_client, order_with_lines):
 
     order_with_lines.refresh_from_db()
     assert order_with_lines.is_fully_paid()
-    assert order_with_lines.history.filter(
-        content='Order manually marked as paid').exists()
+    assert order_with_lines.events.filter(
+        type=OrderEvents.ORDER_MARKED_AS_PAID.value).exists()
 
 
 def test_view_fulfill_order_lines(admin_client, order_with_lines):
@@ -1138,8 +970,60 @@ def test_view_fulfill_order_lines(admin_client, order_with_lines):
     assert get_redirect_location(response) == reverse(
         'dashboard:order-details', kwargs={'order_pk': order_with_lines.pk})
     order_with_lines.refresh_from_db()
-    for line in order_with_lines:
+    for line in order_with_lines.lines.all():
         assert line.quantity_unfulfilled == 0
+
+
+def test_view_fulfill_order_lines_with_empty_quantity(admin_client, order_with_lines):
+    url = reverse(
+        'dashboard:fulfill-order-lines',
+        kwargs={'order_pk': order_with_lines.pk})
+    data = {
+        'csrfmiddlewaretoken': 'hello',
+        'form-INITIAL_FORMS': '0',
+        'form-MAX_NUM_FORMS': '1000',
+        'form-MIN_NUM_FORMS': '0',
+        'form-TOTAL_FORMS': order_with_lines.lines.count(),
+        'send_mail': 'on',
+        'tracking_number': ''}
+    for i, line in enumerate(order_with_lines):
+        data['form-{}-order_line'.format(i)] = line.pk
+        data['form-{}-quantity'.format(i)] = line.quantity_unfulfilled
+
+    # Set first order line's fulfill quantity to 0
+    data['form-0-quantity'] = 0
+
+    response = admin_client.post(url, data)
+    assert response.status_code == 302
+    assert get_redirect_location(response) == reverse(
+        'dashboard:order-details', kwargs={'order_pk': order_with_lines.pk})
+    order_with_lines.refresh_from_db()
+    assert not order_with_lines.lines.all()[0].quantity_unfulfilled == 0
+    for line in order_with_lines.lines.all()[1:]:
+        assert line.quantity_unfulfilled == 0
+
+
+def test_view_fulfill_order_lines_with_all_empty_quantity(
+        admin_client, order_with_lines):
+    url = reverse(
+        'dashboard:fulfill-order-lines',
+        kwargs={'order_pk': order_with_lines.pk})
+    data = {
+        'csrfmiddlewaretoken': 'hello',
+        'form-INITIAL_FORMS': '0',
+        'form-MAX_NUM_FORMS': '1000',
+        'form-MIN_NUM_FORMS': '0',
+        'form-TOTAL_FORMS': order_with_lines.lines.count(),
+        'send_mail': 'on',
+        'tracking_number': ''}
+    for i, line in enumerate(order_with_lines):
+        data['form-{}-order_line'.format(i)] = line.pk
+        data['form-{}-quantity'.format(i)] = 0
+
+    response = admin_client.post(url, data)
+    assert response.status_code == 200
+    for line in order_with_lines.lines.all():
+        assert not line.quantity_unfulfilled == 0
 
 
 def test_render_fulfillment_page(admin_client, order_with_lines):
@@ -1171,4 +1055,48 @@ def test_render_cancel_fulfillment_page(admin_client, fulfilled_order):
         'dashboard:fulfill-order-lines',
         kwargs={'order_pk': fulfilled_order.pk})
     response = admin_client.get(url)
+    assert response.status_code == 200
+
+
+def test_view_add_order_note(admin_client, order_with_lines):
+    url = reverse(
+        'dashboard:order-add-note',
+        kwargs={'order_pk': order_with_lines.pk})
+    note_content = 'this is a note'
+    data = {
+        'csrfmiddlewaretoken': 'hello',
+        'message': note_content}
+    response = admin_client.post(url, data)
+    assert response.status_code == 200
+    order_with_lines.refresh_from_db()
+    assert order_with_lines.events.first().parameters['message'] == note_content  # noqa
+
+
+@pytest.mark.parametrize('type', [e.value for e in OrderEvents])
+def test_order_event_display(admin_user, type, order):
+    parameters = {
+        'message': 'Example Note',
+        'quantity': 12,
+        'email_type': OrderEventsEmails.PAYMENT.value,
+        'email': 'example@example.com',
+        'amount': {'_type': 'Money', 'amount': '10.00', 'currency': 'USD'},
+        'composed_id': 12,
+        'tracking_number': '5421AB',
+        'oversold_items': ['Blue Shirt', 'Red Shirt']}
+    event = OrderEvent(
+        user=admin_user, order=order, parameters=parameters, type=type)
+    event.get_event_display()
+
+
+def test_filter_order_by_status(admin_client):
+    url = reverse('dashboard:orders',)
+    data = {
+        'status': 'unfulfilled', 'payment_status': ChargeStatus.NOT_CHARGED}
+    response = admin_client.get(url, data)
+    assert response.status_code == 200
+
+    data = {
+        'status': 'unfulfilled',
+        'payment_status': ChargeStatus.FULLY_REFUNDED}
+    response = admin_client.get(url, data)
     assert response.status_code == 200

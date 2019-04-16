@@ -1,23 +1,27 @@
-import json
 import os
+import re
 import uuid
 from unittest.mock import patch
 from urllib.parse import urlencode
 
-import pytest
-
 import i18naddress
+import pytest
 from captcha import constants as recaptcha_constants
+from captcha.client import RecaptchaResponse
 from django.core.exceptions import ValidationError
+from django.core.files import File
 from django.forms import Form
 from django.http import QueryDict
 from django.template import Context, Template
 from django.urls import reverse
 from django_countries.fields import Country
+
 from saleor.account import forms, i18n
-from saleor.account.forms import FormWithReCaptcha
+from saleor.account.forms import FormWithReCaptcha, NameForm
 from saleor.account.models import User
 from saleor.account.templatetags.i18n_address_tags import format_address
+from saleor.account.utils import (
+    get_random_avatar, get_user_first_name, get_user_last_name)
 from saleor.account.validators import validate_possible_number
 
 
@@ -170,7 +174,7 @@ def test_address_as_data(address):
         'company_name': 'Mirumee Software',
         'street_address_1': 'Tęczowa 7',
         'street_address_2': '',
-        'city': 'Wrocław',
+        'city': 'WROCŁAW',
         'city_area': '',
         'postal_code': '53-601',
         'country': 'PL',
@@ -214,17 +218,77 @@ def test_user_ajax_label_without_address(admin_user):
     assert admin_user.get_ajax_label() == admin_user.email
 
 
-def test_ajax_users_list(admin_client, admin_user, customer_user):
-    users_list = [
-        {'id': admin_user.pk, 'text': admin_user.get_ajax_label()},
-        {'id': customer_user.pk, 'text': customer_user.get_ajax_label()}]
-    url = reverse('dashboard:ajax-users-list')
+@pytest.mark.parametrize("email, first_name, last_name, full_name", [
+    ('John@example.com', 'John', 'Doe', 'John Doe'),
+    ('John@example.com', 'John', '', 'John'),
+    ('John@example.com', '', 'Doe', 'Doe'),
+    ('John@example.com', '', '', 'John@example.com'),
+])
+def test_get_full_name_user_with_names(email, first_name,
+                                       last_name, full_name, address):
+    user = User(email=email, first_name=first_name, last_name=last_name)
+    assert user.get_full_name() == full_name
 
-    response = admin_client.get(url, HTTP_X_REQUESTED_WITH='XMLHttpRequest')
-    resp_decoded = json.loads(response.content.decode('utf-8'))
 
-    assert response.status_code == 200
-    assert resp_decoded == {'results': users_list}
+@pytest.mark.parametrize("email, first_name, last_name, full_name", [
+    ('John@example.com', 'John', 'Doe', 'John Doe'),
+    ('John@example.com', 'John', '', 'John'),
+    ('John@example.com', '', 'Doe', 'Doe'),
+    ('John@example.com', '', '', 'John@example.com'),
+])
+def test_get_full_name_user_with_address(email, first_name,
+                                         last_name, full_name, address):
+    address.first_name = first_name
+    address.last_name = last_name
+    user = User(email=email, default_billing_address=address)
+    assert user.get_full_name() == full_name
+
+
+@pytest.mark.parametrize("email, first_name, last_name, full_name", [
+    ('John@example.com', 'John', 'Doe', 'John Doe'),
+    ('John@example.com', 'John', '', 'John'),
+    ('John@example.com', '', 'Doe', 'Doe'),
+    ('John@example.com', '', '', 'Arnold Green'),
+])
+def test_get_full_name(email, first_name, last_name, full_name, address):
+    address.first_name = "Arnold"
+    address.last_name = "Green"
+    user = User(
+        email=email, first_name=first_name, last_name=last_name,
+        default_billing_address=address)
+    assert user.get_full_name() == full_name
+
+
+@pytest.mark.parametrize(
+    "first_name, default_billing_address_first_name, result", [
+        ('John', 'Arnold', 'John'),
+        ('John', '', 'John'),
+        ('', 'Arnold', 'Arnold'),
+        ('', '', '')])
+def test_get_user_first_name(first_name, default_billing_address_first_name,
+                             result, address):
+    address.first_name = default_billing_address_first_name
+    user = User(first_name=first_name, default_billing_address=address)
+    assert get_user_first_name(user) == result
+
+
+@pytest.mark.parametrize(
+    "last_name, default_billing_address_last_name, result", [
+        ('Doe', 'Green', 'Doe'),
+        ('Doe', '', 'Doe'),
+        ('', 'Green', 'Green'),
+        ('', '', '')])
+def test_get_user_last_name(last_name, default_billing_address_last_name,
+                            result, address):
+    address.last_name = default_billing_address_last_name
+    user = User(last_name=last_name, default_billing_address=address)
+    assert get_user_last_name(user) == result
+
+
+def test_get_random_avatar():
+    avatar = get_random_avatar()
+    assert isinstance(avatar, File)
+    assert re.match(r"avatar\d+.png", avatar.name)
 
 
 def test_disabled_recaptcha():
@@ -238,12 +302,14 @@ def test_disabled_recaptcha():
     assert form.is_valid()
 
 
-@patch.dict(os.environ, {'RECAPTCHA_TESTING': 'True'})
-def test_requires_recaptcha(settings):
+@patch('captcha.fields.client.submit')
+def test_requires_recaptcha(captcha_submit_mock, settings):
     """
     This test creates a new form
     that should contain a (required) recaptcha field.
     """
+    captcha_submit_mock.return_value = RecaptchaResponse(is_valid=True)
+
     settings.RECAPTCHA_PUBLIC_KEY = recaptcha_constants.TEST_PUBLIC_KEY
     settings.RECAPTCHA_PRIVATE_KEY = recaptcha_constants.TEST_PRIVATE_KEY
 
@@ -299,3 +365,24 @@ def test_view_account_delete_confirm(customer_user, authorized_client):
     assert response.status_code == 302
     customer_user = User.objects.filter(pk=customer_user.pk).first()
     assert customer_user is None
+
+
+def test_form_add_names_to_user(customer_user):
+    name_form = NameForm(
+        {'first_name': 'Jan', 'last_name': 'Nowak'},
+        instance=customer_user)
+    name_form.is_valid()
+    name_form.save()
+    updated_user = User.objects.get(pk=customer_user.pk)
+    assert updated_user.first_name == 'Jan'
+    assert updated_user.last_name == 'Nowak'
+
+
+def test_view_add_names_to_user(customer_user, authorized_client):
+    url = reverse('account:details')
+    response = authorized_client.post(
+        url, data={'first_name': 'Jan', 'last_name': 'Nowak'})
+    assert response.status_code == 200
+    updated_user = User.objects.get(pk=customer_user.pk)
+    assert updated_user.first_name == 'Jan'
+    assert updated_user.last_name == 'Nowak'

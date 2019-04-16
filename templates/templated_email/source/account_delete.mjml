@@ -10,7 +10,7 @@
     <mj-section>
       <mj-column>
         <mj-text font-size="16px">
-          {% trans "Hi!" context "Account delete e-mail text" %}
+          {% trans "Hi!" context "Standard e-mail greeting" %}
         </mj-text>
         <mj-text>
           {% blocktrans trimmed context "Account delete e-mail text" %}
@@ -21,7 +21,7 @@
           {% endblocktrans %}
         </mj-text>
         <mj-text>
-          <a href="{{ url }}">{{ url }}</a>
+          <a href="{{ delete_url }}">{{ delete_url }}</a>
           </mj-text>
       </mj-column>
     </mj-section>

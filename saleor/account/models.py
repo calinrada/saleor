@@ -4,14 +4,14 @@ from django.conf import settings
 from django.contrib.auth.models import (
     AbstractBaseUser, BaseUserManager, PermissionsMixin)
 from django.db import models
-from django.db.models import Q
+from django.db.models import Q, Value
 from django.forms.models import model_to_dict
 from django.utils import timezone
 from django.utils.translation import pgettext_lazy
 from django_countries.fields import Country, CountryField
-from phonenumber_field.modelfields import PhoneNumberField
+from phonenumber_field.modelfields import PhoneNumber, PhoneNumberField
+from versatileimagefield.fields import VersatileImageField
 
-from ..core.models import BaseNote
 from .validators import validate_possible_number
 
 
@@ -19,6 +19,23 @@ class PossiblePhoneNumberField(PhoneNumberField):
     """Less strict field for phone numbers written to database."""
 
     default_validators = [validate_possible_number]
+
+
+class AddressQueryset(models.QuerySet):
+    def annotate_default(self, user):
+        # Set default shipping/billing address pk to None
+        # if default shipping/billing address doesn't exist
+        default_shipping_address_pk, default_billing_address_pk = None, None
+        if user.default_shipping_address:
+            default_shipping_address_pk = user.default_shipping_address.pk
+        if user.default_billing_address:
+            default_billing_address_pk = user.default_billing_address.pk
+
+        return user.addresses.annotate(
+            user_default_shipping_address_pk=Value(
+                default_shipping_address_pk, models.IntegerField()),
+            user_default_billing_address_pk=Value(
+                default_billing_address_pk, models.IntegerField()))
 
 
 class Address(models.Model):
@@ -34,6 +51,11 @@ class Address(models.Model):
     country_area = models.CharField(max_length=128, blank=True)
     phone = PossiblePhoneNumberField(blank=True, default='')
 
+    objects = AddressQueryset.as_manager()
+
+    class Meta:
+        ordering = ('pk', )
+
     @property
     def full_name(self):
         return '%s %s' % (self.first_name, self.last_name)
@@ -43,18 +65,12 @@ class Address(models.Model):
             return '%s - %s' % (self.company_name, self.full_name)
         return self.full_name
 
-    def __repr__(self):
-        return (
-            'Address(first_name=%r, last_name=%r, company_name=%r, '
-            'street_address_1=%r, street_address_2=%r, city=%r, '
-            'postal_code=%r, country=%r, country_area=%r, phone=%r)' % (
-                self.first_name, self.last_name, self.company_name,
-                self.street_address_1, self.street_address_2, self.city,
-                self.postal_code, self.country, self.country_area,
-                self.phone))
-
     def __eq__(self, other):
         return self.as_data() == other.as_data()
+
+    def __hash__(self):
+        # FIXME: in Django 2.2 this is not present if __eq__ is defined
+        return super().__hash__()
 
     def as_data(self):
         """Return the address as a dict suitable for passing as kwargs.
@@ -64,6 +80,8 @@ class Address(models.Model):
         data = model_to_dict(self, exclude=['id', 'user'])
         if isinstance(data['country'], Country):
             data['country'] = data['country'].code
+        if isinstance(data['phone'], PhoneNumber):
+            data['phone'] = data['phone'].as_e164
         return data
 
     def get_copy(self):
@@ -107,6 +125,8 @@ def get_token():
 
 class User(PermissionsMixin, AbstractBaseUser):
     email = models.EmailField(unique=True)
+    first_name = models.CharField(max_length=256, blank=True)
+    last_name = models.CharField(max_length=256, blank=True)
     addresses = models.ManyToManyField(
         Address, blank=True, related_name='user_addresses')
     is_staff = models.BooleanField(default=False)
@@ -120,6 +140,8 @@ class User(PermissionsMixin, AbstractBaseUser):
     default_billing_address = models.ForeignKey(
         Address, related_name='+', null=True, blank=True,
         on_delete=models.SET_NULL)
+    avatar = VersatileImageField(
+        upload_to='user-avatars', blank=True, null=True)
 
     USERNAME_FIELD = 'email'
 
@@ -127,22 +149,24 @@ class User(PermissionsMixin, AbstractBaseUser):
 
     class Meta:
         permissions = (
-            ('view_user',
-             pgettext_lazy('Permission description', 'Can view users')),
-            ('edit_user',
-             pgettext_lazy('Permission description', 'Can edit users')),
-            ('view_group',
-             pgettext_lazy('Permission description', 'Can view groups')),
-            ('edit_group',
-             pgettext_lazy('Permission description', 'Can edit groups')),
-            ('view_staff',
-             pgettext_lazy('Permission description', 'Can view staff')),
-            ('edit_staff',
-             pgettext_lazy('Permission description', 'Can edit staff')),
-            ('impersonate_user',
-             pgettext_lazy('Permission description', 'Can impersonate users')))
+            (
+                'manage_users', pgettext_lazy(
+                    'Permission description', 'Manage customers.')),
+            (
+                'manage_staff', pgettext_lazy(
+                    'Permission description', 'Manage staff.')),
+            (
+                'impersonate_users', pgettext_lazy(
+                    'Permission description', 'Impersonate customers.')))
 
     def get_full_name(self):
+        if self.first_name or self.last_name:
+            return ('%s %s' % (self.first_name, self.last_name)).strip()
+        if self.default_billing_address:
+            first_name = self.default_billing_address.first_name
+            last_name = self.default_billing_address.last_name
+            if first_name or last_name:
+                return ('%s %s' % (first_name, last_name)).strip()
         return self.email
 
     def get_short_name(self):
@@ -156,7 +180,13 @@ class User(PermissionsMixin, AbstractBaseUser):
         return self.email
 
 
-class CustomerNote(BaseNote):
+class CustomerNote(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, blank=True, null=True,
+        on_delete=models.SET_NULL)
+    date = models.DateTimeField(db_index=True, auto_now_add=True)
+    content = models.TextField()
+    is_public = models.BooleanField(default=True)
     customer = models.ForeignKey(
         settings.AUTH_USER_MODEL, related_name='notes',
         on_delete=models.CASCADE)

@@ -1,24 +1,29 @@
-import json
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 from django.urls import reverse
 from django_countries.fields import Country
-from payments import FraudStatus, PaymentStatus
 from prices import Money, TaxedMoney
-from tests.utils import get_redirect_location
 
 from saleor.account.models import User
 from saleor.checkout.utils import create_order
+from saleor.core.exceptions import InsufficientStock
 from saleor.core.utils.taxes import (
     DEFAULT_TAX_RATE_NAME, get_tax_rate_by_name, get_taxes_for_country)
+from saleor.core.weight import zero_weight
 from saleor.order import FulfillmentStatus, OrderStatus, models
-from saleor.order.forms import OrderNoteForm
-from saleor.order.models import Order
+from saleor.order.models import Fulfillment, Order
 from saleor.order.utils import (
-    add_variant_to_order, cancel_fulfillment, cancel_order, recalculate_order,
+    add_variant_to_order, automatically_fulfill_digital_lines,
+    cancel_fulfillment, cancel_order, change_order_line_quantity,
+    delete_order_line, fulfill_order_line, recalculate_order,
     restock_fulfillment_lines, restock_order_lines, update_order_prices,
     update_order_status)
+from saleor.payment import ChargeStatus
+from saleor.payment.models import Payment
+from saleor.product.models import DigitalContent
+from tests.utils import create_image, get_redirect_location
 
 
 def test_total_setter():
@@ -65,11 +70,11 @@ def test_get_tax_rate_by_name_empty_taxes(product):
 
 
 def test_add_variant_to_order_adds_line_for_new_variant(
-        order_with_lines, product, taxes):
+        order_with_lines, product, taxes, product_translation_fr, settings):
     order = order_with_lines
     variant = product.variants.get()
     lines_before = order.lines.count()
-
+    settings.LANGUAGE_CODE = 'fr'
     add_variant_to_order(order, variant, 1, taxes=taxes)
 
     line = order.lines.last()
@@ -79,6 +84,8 @@ def test_add_variant_to_order_adds_line_for_new_variant(
     assert line.unit_price == TaxedMoney(
         net=Money('8.13', 'USD'), gross=Money(10, 'USD'))
     assert line.tax_rate == taxes[product.tax_rate]['value']
+    assert line.translated_product_name == variant.display_product(
+        translated=True)
 
 
 @pytest.mark.parametrize('track_inventory', (True, False))
@@ -126,6 +133,22 @@ def test_add_variant_to_order_allocates_stock_for_existing_variant(
     assert variant.quantity_allocated == stock_before + 1
 
 
+def test_add_variant_to_order_allow_overselling(order_with_lines):
+    existing_line = order_with_lines.lines.first()
+    variant = existing_line.variant
+    stock_before = variant.quantity_allocated
+
+    quantity = variant.quantity + 1
+    with pytest.raises(InsufficientStock):
+        add_variant_to_order(
+            order_with_lines, variant, quantity, allow_overselling=False)
+
+    add_variant_to_order(
+        order_with_lines, variant, quantity, allow_overselling=True)
+    variant.refresh_from_db()
+    assert variant.quantity_allocated == stock_before + quantity
+
+
 def test_view_connect_order_with_user_authorized_user(
         order, authorized_client, customer_user):
     order.user_email = customer_user.email
@@ -161,13 +184,29 @@ def test_view_connect_order_with_user_different_email(
     assert order.user is None
 
 
-def test_add_note_to_order(order_with_lines):
+def test_view_order_with_deleted_variant(authorized_client, order_with_lines):
     order = order_with_lines
-    note = models.OrderNote(order=order, user=order.user)
-    note_form = OrderNoteForm({'content': 'test_note'}, instance=note)
-    note_form.is_valid()
-    note_form.save()
-    assert order.notes.first().content == 'test_note'
+    order_details_url = reverse('order:details', kwargs={'token': order.token})
+
+    # delete a variant associated to the order
+    order.lines.first().variant.delete()
+
+    # check if the order details view handles the deleted variant
+    response = authorized_client.get(order_details_url)
+    assert response.status_code == 200
+
+
+def test_view_fulfilled_order_with_deleted_variant(
+        authorized_client, fulfilled_order):
+    order = fulfilled_order
+    order_details_url = reverse('order:details', kwargs={'token': order.token})
+
+    # delete a variant associated to the order
+    order.lines.first().variant.delete()
+
+    # check if the order details view handles the deleted variant
+    response = authorized_client.get(order_details_url)
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize('track_inventory', (True, False))
@@ -325,7 +364,7 @@ def test_order_queryset_drafts(draft_order):
     assert all([order not in draft_orders for order in other_orders])
 
 
-def test_order_queryset_to_ship():
+def test_order_queryset_to_ship(settings):
     total = TaxedMoney(net=Money(10, 'USD'), gross=Money(15, 'USD'))
     orders_to_ship = [
         Order.objects.create(status=OrderStatus.UNFULFILLED, total=total),
@@ -334,9 +373,10 @@ def test_order_queryset_to_ship():
     ]
     for order in orders_to_ship:
         order.payments.create(
-            variant='default', status=PaymentStatus.CONFIRMED, currency='USD',
-            total=order.total_gross.amount,
-            captured_amount=order.total_gross.amount)
+            gateway=settings.DUMMY, charge_status=ChargeStatus.FULLY_CHARGED,
+            total=order.total.gross.amount,
+            captured_amount=order.total.gross.amount,
+            currency=order.total.gross.currency)
 
     orders_not_to_ship = [
         Order.objects.create(status=OrderStatus.DRAFT, total=total),
@@ -347,43 +387,32 @@ def test_order_queryset_to_ship():
         Order.objects.create(status=OrderStatus.CANCELED, total=total)
     ]
 
-    orders = Order.objects.to_ship()
+    orders = Order.objects.ready_to_fulfill()
 
     assert all([order in orders for order in orders_to_ship])
     assert all([order not in orders for order in orders_not_to_ship])
 
 
-def test_ajax_order_shipping_methods_list(
-        admin_client, order, shipping_method):
-    method = shipping_method.price_per_country.get()
-    shipping_methods_list = [
-        {'id': method.pk, 'text': method.get_ajax_label()}]
-    url = reverse(
-        'dashboard:ajax-order-shipping-methods', kwargs={'order_pk': order.pk})
+def test_queryset_ready_to_capture():
+    total = TaxedMoney(net=Money(10, 'USD'), gross=Money(15, 'USD'))
 
-    response = admin_client.get(url, HTTP_X_REQUESTED_WITH='XMLHttpRequest')
-    resp_decoded = json.loads(response.content.decode('utf-8'))
+    preauth_order = Order.objects.create(
+        status=OrderStatus.UNFULFILLED, total=total)
+    Payment.objects.create(
+        order=preauth_order,
+        charge_status=ChargeStatus.NOT_CHARGED, is_active=True)
 
-    assert response.status_code == 200
-    assert resp_decoded == {'results': shipping_methods_list}
+    orders = [
+        Order.objects.create(status=OrderStatus.DRAFT, total=total),
+        Order.objects.create(status=OrderStatus.UNFULFILLED, total=total),
+        preauth_order,
+        Order.objects.create(status=OrderStatus.CANCELED, total=total)]
 
-
-def test_ajax_order_shipping_methods_list_different_country(
-        admin_client, order, shipping_method):
-    order.shipping_address = order.billing_address.get_copy()
-    order.save()
-    method = shipping_method.price_per_country.get()
-    shipping_methods_list = [
-        {'id': method.pk, 'text': method.get_ajax_label()}]
-    shipping_method.price_per_country.create(price=15, country_code='DE')
-    url = reverse(
-        'dashboard:ajax-order-shipping-methods', kwargs={'order_pk': order.pk})
-
-    response = admin_client.get(url, HTTP_X_REQUESTED_WITH='XMLHttpRequest')
-    resp_decoded = json.loads(response.content.decode('utf-8'))
-
-    assert response.status_code == 200
-    assert resp_decoded == {'results': shipping_methods_list}
+    qs = Order.objects.ready_to_capture()
+    assert preauth_order in qs
+    statuses = [o.status for o in qs]
+    assert OrderStatus.DRAFT not in statuses
+    assert OrderStatus.CANCELED not in statuses
 
 
 def test_update_order_prices(order_with_lines):
@@ -396,7 +425,7 @@ def test_update_order_prices(order_with_lines):
     line_2 = order_with_lines.lines.last()
     price_1 = line_1.variant.get_price(taxes=taxes)
     price_2 = line_2.variant.get_price(taxes=taxes)
-    shipping_price = order_with_lines.shipping_method.get_total_price(taxes)
+    shipping_price = order_with_lines.shipping_method.get_total(taxes)
 
     update_order_prices(order_with_lines, None)
 
@@ -411,35 +440,36 @@ def test_update_order_prices(order_with_lines):
 
 
 def test_order_payment_flow(
-        request_cart_with_item, client, address, shipping_method):
-    request_cart_with_item.shipping_address = address
-    request_cart_with_item.billing_address = address.get_copy()
-    request_cart_with_item.email = 'test@example.com'
-    request_cart_with_item.shipping_method = (
-        shipping_method.price_per_country.first())
-    request_cart_with_item.save()
+        request_checkout_with_item, client, address, shipping_zone, settings):
+    request_checkout_with_item.shipping_address = address
+    request_checkout_with_item.billing_address = address.get_copy()
+    request_checkout_with_item.email = 'test@example.com'
+    request_checkout_with_item.shipping_method = (
+        shipping_zone.shipping_methods.first())
+    request_checkout_with_item.save()
 
     order = create_order(
-        request_cart_with_item, 'tracking_code', discounts=None, taxes=None)
+        request_checkout_with_item, 'tracking_code', discounts=None, taxes=None)
 
-    # Select payment method
+    # Select payment
     url = reverse('order:payment', kwargs={'token': order.token})
-    data = {'method': 'default'}
+    data = {'gateway': settings.DUMMY}
     response = client.post(url, data, follow=True)
 
     assert len(response.redirect_chain) == 1
     assert response.status_code == 200
     redirect_url = reverse(
-        'order:payment', kwargs={'token': order.token, 'variant': 'default'})
+        'order:payment',
+        kwargs={'token': order.token, 'gateway': settings.DUMMY})
     assert response.request['PATH_INFO'] == redirect_url
 
     # Go to payment details page, enter payment data
     data = {
-        'status': PaymentStatus.PREAUTH,
-        'fraud_status': FraudStatus.UNKNOWN,
-        'gateway_response': '3ds-disabled',
-        'verification_result': 'waiting'}
-
+        'gateway': settings.DUMMY,
+        'is_active': True,
+        'total': order.total.gross.amount,
+        'currency': order.total.gross.currency,
+        'charge_status': ChargeStatus.FULLY_CHARGED}
     response = client.post(redirect_url, data)
 
     assert response.status_code == 302
@@ -447,21 +477,13 @@ def test_order_payment_flow(
         'order:payment-success', kwargs={'token': order.token})
     assert get_redirect_location(response) == redirect_url
 
-    # Complete payment, go to checkout success page
-    data = {'status': 'ok'}
-    response = client.post(redirect_url, data)
-    assert response.status_code == 302
-    redirect_url = reverse(
-        'order:checkout-success', kwargs={'token': order.token})
-    assert get_redirect_location(response) == redirect_url
-
     # Assert that payment object was created and contains correct data
     payment = order.payments.all()[0]
     assert payment.total == order.total.gross.amount
-    assert payment.tax == order.total.tax.amount
-    assert payment.currency == order.total.currency
-    assert payment.delivery == order.shipping_price.net.amount
-    assert len(payment.get_purchased_items()) == len(order.lines.all())
+    assert payment.currency == order.total.gross.currency
+    assert payment.transactions.count() == 2
+    assert payment.transactions.first().kind == 'auth'
+    assert payment.transactions.last().kind == 'capture'
 
 
 def test_create_user_after_order(order, client):
@@ -477,3 +499,153 @@ def test_create_user_after_order(order, client):
     user = User.objects.filter(email='hello@mirumee.com').first()
     assert user is not None
     assert user.orders.filter(token=order.token).exists()
+
+
+def test_view_order_details(order, client):
+    url = reverse('order:details', kwargs={'token': order.token})
+    response = client.get(url)
+    assert response.status_code == 200
+
+
+def test_add_order_note_view(order, authorized_client, customer_user):
+    order.user_email = customer_user.email
+    order.save()
+    url = reverse('order:details', kwargs={'token': order.token})
+    customer_note = 'bla-bla note'
+    data = {'customer_note': customer_note}
+
+    response = authorized_client.post(url, data)
+
+    redirect_url = reverse('order:details', kwargs={'token': order.token})
+    assert get_redirect_location(response) == redirect_url
+    order.refresh_from_db()
+    assert order.customer_note == customer_note
+
+
+def _calculate_order_weight_from_lines(order):
+    weight = zero_weight()
+    for line in order:
+        weight += line.variant.get_weight() * line.quantity
+    return weight
+
+
+def test_calculate_order_weight(order_with_lines):
+    order_weight = order_with_lines.weight
+    calculated_weight = _calculate_order_weight_from_lines(order_with_lines)
+    assert calculated_weight == order_weight
+
+
+def test_order_weight_add_more_variant(order_with_lines):
+    variant = order_with_lines.lines.first().variant
+    add_variant_to_order(order_with_lines, variant, 2)
+    order_with_lines.refresh_from_db()
+    assert order_with_lines.weight == _calculate_order_weight_from_lines(
+        order_with_lines)
+
+
+def test_order_weight_add_new_variant(order_with_lines, product):
+    variant = product.variants.first()
+    add_variant_to_order(order_with_lines, variant, 2)
+    order_with_lines.refresh_from_db()
+    assert order_with_lines.weight == _calculate_order_weight_from_lines(
+        order_with_lines)
+
+
+def test_order_weight_change_line_quantity(order_with_lines):
+    line = order_with_lines.lines.first()
+    new_quantity = line.quantity + 2
+    change_order_line_quantity(line, new_quantity)
+    order_with_lines.refresh_from_db()
+    assert order_with_lines.weight == _calculate_order_weight_from_lines(
+        order_with_lines)
+
+
+def test_order_weight_delete_line(order_with_lines):
+    line = order_with_lines.lines.first()
+    delete_order_line(line)
+    assert order_with_lines.weight == _calculate_order_weight_from_lines(
+        order_with_lines)
+
+
+def test_get_order_weight_non_existing_product(order_with_lines, product):
+    # Removing product should not affect order's weight
+    order = order_with_lines
+    variant = product.variants.first()
+    add_variant_to_order(order, variant, 1)
+    old_weight = order.get_total_weight()
+
+    product.delete()
+
+    order.refresh_from_db()
+    new_weight = order.get_total_weight()
+
+    assert old_weight == new_weight
+
+
+@patch('saleor.order.utils.emails.send_fulfillment_confirmation')
+@patch('saleor.order.utils.get_default_digital_content_settings')
+def test_fulfill_digital_lines(
+        mock_digital_settings, mock_email_fulfillment, order_with_lines):
+    mock_digital_settings.return_value = {'automatic_fulfillment': True}
+    line = order_with_lines.lines.all()[0]
+
+    image_file, image_name = create_image()
+    variant = line.variant
+    digital_content = DigitalContent.objects.create(
+        content_file=image_file, product_variant=variant,
+        use_default_settings=True)
+
+    line.variant.digital_content = digital_content
+    line.is_shipping_required = False
+    line.save()
+
+    order_with_lines.refresh_from_db()
+    automatically_fulfill_digital_lines(order_with_lines)
+    line.refresh_from_db()
+    fulfillment = Fulfillment.objects.get(order=order_with_lines)
+    fulfillment_lines = fulfillment.lines.all()
+
+    assert fulfillment_lines.count() == 1
+    assert line.digital_content_url
+    assert mock_email_fulfillment.delay.called
+
+
+def test_fulfill_order_line(order_with_lines):
+    order = order_with_lines
+    line = order.lines.first()
+    quantity_fulfilled_before = line.quantity_fulfilled
+    variant = line.variant
+    stock_quantity_after = variant.quantity - line.quantity
+
+    fulfill_order_line(line, line.quantity)
+
+    variant.refresh_from_db()
+    assert variant.quantity == stock_quantity_after
+    assert line.quantity_fulfilled == quantity_fulfilled_before + line.quantity
+
+
+def test_fulfill_order_line_with_variant_deleted(order_with_lines):
+    line = order_with_lines.lines.first()
+    line.variant.delete()
+
+    line.refresh_from_db()
+
+    fulfill_order_line(line, line.quantity)
+
+
+def test_fulfill_order_line_without_inventory_tracking(order_with_lines):
+    order = order_with_lines
+    line = order.lines.first()
+    quantity_fulfilled_before = line.quantity_fulfilled
+    variant = line.variant
+    variant.track_inventory = False
+    variant.save()
+
+    # stock should not change
+    stock_quantity_after = variant.quantity
+
+    fulfill_order_line(line, line.quantity)
+
+    variant.refresh_from_db()
+    assert variant.quantity == stock_quantity_after
+    assert line.quantity_fulfilled == quantity_fulfilled_before + line.quantity
